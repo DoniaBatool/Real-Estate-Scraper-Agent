@@ -39,3 +39,12 @@ async def get_db():
     _, factory = _get_engine()
     async with factory() as session:
         yield session
+
+
+async def init_db() -> None:
+    engine, _ = _get_engine()
+    # Import models so SQLAlchemy metadata includes all tables.
+    from backend.database import models  # noqa: F401
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)

@@ -20,6 +20,8 @@ export interface Agency {
   price_range_max?: number;
   currency?: string;
   total_listings?: number;
+  /** Inferred from menus + listing types */
+  property_categories?: string[];
   city?: string;
   country?: string;
   scrape_status?: string;
@@ -39,6 +41,8 @@ export interface Property {
   bedroom_sqm?: number;
   bathroom_sqm?: number;
   total_sqm?: number;
+  /** Land / outdoor plot size when available */
+  plot_sqm?: number;
   price?: number;
   price_per_sqm?: number;
   currency?: string;
@@ -52,6 +56,19 @@ export interface Property {
   amenities?: string[];
   listing_url?: string;
   created_at?: string;
+  /** LLM / extraction extras */
+  furnished?: string | boolean;
+  /** Listing reference / SKU */
+  reference?: string;
+  listing_reference?: string;
+  floor_number?: number;
+  total_floors?: number;
+  year_built?: number;
+  condition?: string;
+  energy_rating?: string;
+  virtual_tour_url?: string;
+  /** Single-line formatted address when scraped */
+  full_address?: string;
 }
 
 export interface ScrapeJob {
@@ -62,6 +79,63 @@ export interface ScrapeJob {
   agencies_found: number;
   agencies_scraped: number;
   message: string;
+}
+
+/** Structured payloads returned with assistant replies (tables, agency drill-down). */
+export type ChatMessageDisplayMeta =
+  | {
+      display: "agency_table";
+      caption?: string;
+      columns: { key: string; label: string }[];
+      rows: Record<string, unknown>[];
+    }
+  | {
+      display: "agency_detail";
+      agency: Agency;
+      properties: Property[];
+    };
+
+export interface ChatResponse {
+  reply: string;
+  action: string;
+  job?: ScrapeJob;
+  context_summary?: {
+    summary: string;
+    message_count: number;
+  };
+  recent_turns_used: number;
+  /** UI payload: tables and agency/property detail blocks */
+  message_meta?: ChatMessageDisplayMeta | Record<string, unknown> | null;
+}
+
+export interface ChatThread {
+  id: string;
+  title: string;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+  last_message_preview?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  thread_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface ChatToolRun {
+  id: string;
+  thread_id: string;
+  message_id?: string;
+  tool_name: string;
+  tool_args?: Record<string, unknown>;
+  rationale?: string;
+  status: string;
+  output?: Record<string, unknown>;
+  created_at: string;
 }
 
 export interface PricingData {

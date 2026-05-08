@@ -117,3 +117,24 @@ def test_captcha_detection_positive():
 def test_captcha_detection_negative():
     from backend.scraper.captcha import _has_captcha
     assert _has_captcha("<html><body>Normal page content</body></html>") is False
+
+
+def test_discover_listing_urls_same_origin():
+    from backend.scraper.html_signals import discover_listing_urls
+
+    html = '<a href="/property/sea-view-123">View</a><a href="https://other.com/listing/x">Ext</a>'
+    urls = discover_listing_urls(html, "https://example.com/", max_urls=10)
+    assert any("/property/" in u for u in urls)
+    assert all("other.com" not in u for u in urls)
+
+
+def test_extract_footer_signals_finds_email_and_facebook():
+    from backend.scraper.html_signals import extract_footer_signals
+
+    sig = extract_footer_signals(
+        'Contact <a href="mailto:team@agency.mt">e</a> '
+        '<a href="https://www.facebook.com/myagency">fb</a>',
+        "https://agency.mt/",
+    )
+    assert "team@agency.mt" in sig["email"]
+    assert sig["facebook_url"] and "facebook.com" in sig["facebook_url"]

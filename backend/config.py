@@ -32,5 +32,12 @@ class Settings(BaseSettings):
     proxy_host: str = ""
     proxy_port: str = ""
 
+    # Multi-page scrape: max individual property detail pages per agency (after listings index)
+    scrape_max_property_detail_pages: int = 50
+
+    # ARIA chat agent (OpenAI tool loop); falls back to rule-based chat if disabled or on error
+    use_aria_agent: bool = True
+    aria_max_tool_rounds: int = 8
+
 
 settings = Settings()

@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS properties (
   bedroom_sqm     FLOAT,
   bathroom_sqm    FLOAT,
   total_sqm       FLOAT,
+  plot_sqm        FLOAT,
+  furnished       TEXT,
+  floor_number    INT,
+  total_floors    INT,
+  year_built      INT,
+  condition       TEXT,
+  energy_rating   TEXT,
+  virtual_tour_url TEXT,
+  listing_reference TEXT,
+  full_address    TEXT,
   price           FLOAT,
   price_per_sqm   FLOAT,
   currency        TEXT DEFAULT 'EUR',
@@ -66,3 +76,6 @@ CREATE INDEX IF NOT EXISTS idx_properties_locality ON properties(locality);
 CREATE INDEX IF NOT EXISTS idx_properties_type     ON properties(property_type);
 CREATE INDEX IF NOT EXISTS idx_properties_price    ON properties(price);
 CREATE INDEX IF NOT EXISTS idx_agencies_city       ON agencies(city, country);
+
+-- Categories / departments inferred from site navigation + listings (run once if DB existed before this column)
+ALTER TABLE agencies ADD COLUMN IF NOT EXISTS property_categories TEXT[];

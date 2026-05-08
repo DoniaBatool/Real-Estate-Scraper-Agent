@@ -300,6 +300,16 @@ CREATE TABLE properties (
   bedroom_sqm     FLOAT,
   bathroom_sqm    FLOAT,
   total_sqm       FLOAT,
+  plot_sqm        FLOAT,
+  furnished       TEXT,
+  floor_number    INT,
+  total_floors    INT,
+  year_built      INT,
+  condition       TEXT,
+  energy_rating   TEXT,
+  virtual_tour_url TEXT,
+  listing_reference TEXT,
+  full_address    TEXT,
   price           FLOAT,
   price_per_sqm   FLOAT,
   currency        TEXT DEFAULT 'EUR',
@@ -321,6 +331,8 @@ CREATE INDEX idx_properties_type     ON properties(property_type);
 CREATE INDEX idx_properties_price    ON properties(price);
 CREATE INDEX idx_agencies_city       ON agencies(city, country);
 ```
+
+For databases created before these columns existed, run `backend/database/migrations/add_properties_extended_columns.sql` in the Supabase SQL Editor (uses `ADD COLUMN IF NOT EXISTS`, safe to re-run).
 
 ---
 
@@ -428,6 +440,11 @@ pytest-asyncio==0.23.6
 - `ai/extractor.py` — OpenAI call + JSON parsing
 - `database/crud.py` — save to Supabase
 - `routers/scraper.py` — POST /api/scrape
+
+**Multi-page crawl (production pipeline):**
+- `scraper/listing_discovery.py` — probes common `/properties`-style paths + parses homepage nav links → listings index URL; collects candidate detail URLs via BeautifulSoup + regex heuristics + merge with `html_signals.discover_listing_urls`.
+- `scraper/engine.py` — `MultiPageScraper.scrape_agency_complete(url)` chains layered `ScraperEngine`: homepage → listings page (if found) → up to **`SCRAPE_MAX_PROPERTY_DETAIL_PAGES`** detail URLs (default **50**), with random delays between detail fetches.
+- `ai/extractor.py` — `extract_agency_info` (header/footer-weighted HTML), `extract_single_property` (JSON-LD + HTML), `extract_properties_from_listings` fallback for grid pages, `extract_from_multipage` orchestration + footer regex merge + dedupe.
 
 **Key engine code:**
 ```python

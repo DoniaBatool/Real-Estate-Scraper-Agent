@@ -29,6 +29,7 @@ class AgencyOut(BaseModel):
     price_range_max: Optional[float] = None
     currency: Optional[str] = None
     total_listings: Optional[int] = None
+    property_categories: Optional[list[str]] = None
     logo_url: Optional[str] = None
     description: Optional[str] = None
     city: Optional[str] = None

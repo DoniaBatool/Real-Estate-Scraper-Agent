@@ -38,6 +38,7 @@ class Agency(Base):
     price_range_max = Column(Float)
     currency = Column(Text, default="EUR")
     total_listings = Column(Integer)
+    property_categories = Column(ARRAY(Text))
 
     city = Column(Text)
     country = Column(Text)
@@ -65,6 +66,17 @@ class Property(Base):
     bedroom_sqm = Column(Float)
     bathroom_sqm = Column(Float)
     total_sqm = Column(Float)
+    plot_sqm = Column(Float)
+
+    furnished = Column(Text)
+    floor_number = Column(Integer)
+    total_floors = Column(Integer)
+    year_built = Column(Integer)
+    condition = Column(Text)
+    energy_rating = Column(Text)
+    virtual_tour_url = Column(Text)
+    listing_reference = Column(Text)
+    full_address = Column(Text)
 
     price = Column(Float)
     price_per_sqm = Column(Float)
@@ -82,3 +94,58 @@ class Property(Base):
     listing_url = Column(Text)
 
     agency = relationship("Agency", back_populates="properties")
+
+
+class ChatThread(Base):
+    __tablename__ = "chat_threads"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    title = Column(Text, nullable=False, default="New Chat")
+    archived = Column(Boolean, default=False, nullable=False)
+
+    messages = relationship("ChatMessage", back_populates="thread", cascade="all, delete-orphan")
+    summaries = relationship("ChatSummary", back_populates="thread", cascade="all, delete-orphan")
+    tool_runs = relationship("ChatToolRun", back_populates="thread", cascade="all, delete-orphan")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False)
+    role = Column(String, nullable=False)  # user | assistant | system
+    content = Column(Text, nullable=False)
+    meta_json = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    thread = relationship("ChatThread", back_populates="messages")
+
+
+class ChatSummary(Base):
+    __tablename__ = "chat_summaries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False)
+    summary = Column(Text, nullable=False)
+    message_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    thread = relationship("ChatThread", back_populates="summaries")
+
+
+class ChatToolRun(Base):
+    __tablename__ = "chat_tool_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    thread_id = Column(UUID(as_uuid=True), ForeignKey("chat_threads.id", ondelete="CASCADE"), nullable=False)
+    message_id = Column(UUID(as_uuid=True), ForeignKey("chat_messages.id", ondelete="SET NULL"), nullable=True)
+    tool_name = Column(String, nullable=False)
+    tool_args_json = Column(Text)
+    rationale = Column(Text)
+    status = Column(String, nullable=False, default="started")
+    output_json = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    thread = relationship("ChatThread", back_populates="tool_runs")

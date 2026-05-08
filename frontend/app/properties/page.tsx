@@ -3,7 +3,7 @@
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
-import { getProperties } from "@/lib/api";
+import { getAgencies, getAgency, getProperties } from "@/lib/api";
 import type { Property } from "@/types";
 import PropertyTable from "@/components/PropertyTable";
 import { Loader2, TableProperties } from "lucide-react";
@@ -12,16 +12,37 @@ function PropertiesInner() {
   const searchParams = useSearchParams();
   const agencyId = searchParams.get("agency_id") ?? undefined;
   const [properties, setProperties] = useState<Property[]>([]);
+  const [agencyName, setAgencyName] = useState<string | null>(null);
+  const [agencyNames, setAgencyNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    setLoading(true);
-    getProperties({ agency_id: agencyId, limit: 500 })
+    if (!agencyId) {
+      setAgencyName(null);
+      return;
+    }
+    void getAgency(agencyId)
+      .then((a) => setAgencyName(a.name))
+      .catch(() => setAgencyName(null));
+  }, [agencyId]);
+
+  useEffect(() => {
+    getProperties({ agency_id: agencyId, limit: 200 })
       .then(setProperties)
       .catch(() => setError("Failed to load properties"))
       .finally(() => setLoading(false));
   }, [agencyId]);
+
+  useEffect(() => {
+    void getAgencies({ limit: 500 })
+      .then((list) => {
+        const m: Record<string, string> = {};
+        for (const a of list) m[a.id] = a.name;
+        setAgencyNames(m);
+      })
+      .catch(() => setAgencyNames({}));
+  }, []);
 
   return (
     <div style={{ minHeight: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "2.5rem 1.5rem" }}>
@@ -36,9 +57,15 @@ function PropertiesInner() {
           <h1 style={{ fontSize: "1.75rem", fontWeight: 800, color: "var(--text-primary)", letterSpacing: "-0.02em" }}>
             Properties
           </h1>
+          {agencyId && agencyName && (
+            <p style={{ fontSize: "0.85rem", color: "var(--accent-gold)", marginTop: 6, fontWeight: 600 }}>
+              {agencyName}
+            </p>
+          )}
           {properties.length > 0 && (
-            <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginTop: 2 }}>
+            <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginTop: agencyId && agencyName ? 4 : 2 }}>
               {properties.length} listings indexed
+              {agencyId ? " for this agency" : " in the database"}
             </p>
           )}
         </div>
@@ -58,7 +85,7 @@ function PropertiesInner() {
 
         {!loading && !error && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-            <PropertyTable data={properties} />
+            <PropertyTable data={properties} agencyNames={agencyNames} />
           </motion.div>
         )}
       </div>

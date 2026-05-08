@@ -4,54 +4,55 @@ Extract ALL of the following from this HTML and return ONLY valid JSON.
 No markdown. No code blocks. No explanation. Raw JSON only.
 
 AGENCY INFO:
-- agency_name, owner_name, founded_year
-- email (array — every email found on page)
-- phone (array — every phone number found)
-- whatsapp
-- facebook_url, instagram_url, linkedin_url, twitter_url
+- agency_name (business trading name)
+- owner_name: principal broker / director / owner IF stated (often on About, Team, Meet us, Contact, Imprint). Null if not explicitly named.
+- founded_year (int)
+- email (array — collect EVERY visible email, including footer, header, contact widgets)
+- phone (array — visible phone numbers)
+- whatsapp (wa.me / WhatsApp links if present)
+- facebook_url, instagram_url, linkedin_url, twitter_url / X (scan FOOTER and HEADER — icons often link here)
 - google_rating (float), review_count (int)
 - price_range_min (float), price_range_max (float), currency
 - specialization (one of: residential/commercial/luxury/all)
-- description (max 300 chars), logo_url
+- description (max 400 chars), logo_url (absolute URL if present)
+- property_categories (array of strings — high-level services or departments shown on site,
+  e.g. "Residential sales", "Long lets", "Holiday rentals", "Commercial", "New developments".
+  Derive from navigation menus or section headings when explicit.)
 
-PROPERTIES (array — extract EVERY listing visible on this page):
+PROPERTIES (array):
+Extract EVERY property listing represented on this HTML.
+
+If this HTML is a SINGLE listing/detail page, return EXACTLY ONE object in "properties" with as much detail as exists.
+
+For EACH property:
 - title
+- category (marketing category label ON THE LISTING if any — e.g. "Seafront", "Penthouse", "Investment"; null if none)
 - property_type (one of: villa/apartment/townhouse/commercial/land/other)
 - bedrooms (int — null if not found, do NOT guess)
-- bathrooms (int — null if not found, do NOT guess)
-- total_sqm (float — null if not found, do NOT guess)
-- bedroom_sqm (float — null if not found)
-- bathroom_sqm (float — null if not found)
-- price (float — null if not found, do NOT guess)
-- price_per_sqm (float — compute ONLY if both price and total_sqm are found)
-- currency (default EUR if in Europe, USD if in USA, AED if in UAE)
-- locality (neighborhood name)
+- bathrooms (int — null if not found, do NOT guess; synonyms: baths/WC)
+- total_sqm (float — total internal/living area; null if not found)
+- bedroom_sqm (float — ONLY if a separate bedroom size is stated)
+- bathroom_sqm (float — ONLY if a separate bathroom size is stated)
+- price (numeric — null if not found, do NOT guess)
+- price_per_sqm (float — ONLY if both price and total_sqm are explicitly known)
+- currency
+- locality (neighbourhood / area)
 - district, city, country
-- latitude (float — null if not found)
-- longitude (float — null if not found)
-- listing_date (YYYY-MM-DD format — null if not found)
-- images (array of absolute URLs — empty array if none)
-- description (max 200 chars)
-- amenities (array of strings — empty array if none)
-- listing_url (full URL of this listing if found)
+- latitude (float), longitude (float) — null if not found
+- listing_date (YYYY-MM-DD — null if not found)
+- images (array of absolute image URLs for this listing)
+- description (max 280 chars — listing description)
+- amenities (array of strings)
+- listing_url (FULL canonical URL for this listing — from canonical link, og:url, or address bar context)
 
 IMPORTANT RULES:
-1. Return null for ANY field not found — NEVER guess or fabricate values
-2. Extract ALL properties visible — do not stop at first few
-3. If only a listing title is visible (detail page not loaded), still include it with null fields
-4. Return ONLY raw JSON — no markdown, no ```json wrapper, no explanation
-5. If the page has NO properties at all, return empty array: "properties": []
+1. Return null for ANY field not present in the HTML — NEVER invent facts.
+2. Extract ALL listings shown in grids, carousels, and search results — not only the first.
+3. On listing cards, copy price, beds, baths, and area when shown.
+4. Return ONLY raw JSON — no markdown fences.
+5. If the page has NO property listings, return: "properties": []
+6. If login/CAPTCHA/blocked: {"notes": "brief reason", "agency_name": null, "properties": []}
 
-If the page requires login, shows a CAPTCHA, or blocks access:
-- Return this exact structure:
-  {"notes": "reason here", "agency_name": null, "properties": []}
-
-Expected output structure:
-{
-  "agency_name": "...",
-  "owner_name": null,
-  "email": [],
-  "phone": [],
-  "properties": [...]
-}
+Expected top-level keys include:
+agency_name, owner_name, property_categories, email, phone, properties, ...
 """

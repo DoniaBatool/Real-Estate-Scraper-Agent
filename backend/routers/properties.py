@@ -23,6 +23,16 @@ class PropertyOut(BaseModel):
     bedroom_sqm: Optional[float] = None
     bathroom_sqm: Optional[float] = None
     total_sqm: Optional[float] = None
+    plot_sqm: Optional[float] = None
+    furnished: Optional[str] = None
+    floor_number: Optional[int] = None
+    total_floors: Optional[int] = None
+    year_built: Optional[int] = None
+    condition: Optional[str] = None
+    energy_rating: Optional[str] = None
+    virtual_tour_url: Optional[str] = None
+    listing_reference: Optional[str] = None
+    full_address: Optional[str] = None
     price: Optional[float] = None
     price_per_sqm: Optional[float] = None
     currency: Optional[str] = None

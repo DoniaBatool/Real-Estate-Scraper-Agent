@@ -10,8 +10,8 @@ from pydantic import BaseModel
 from backend.database.connection import _get_engine
 from backend.database import crud
 from backend.discovery.apify_client import discover_agencies_sync
-from backend.scraper.engine import ScraperEngine
-from backend.ai.extractor import extract_data
+from backend.scraper.engine import MultiPageScraper, ScraperEngine
+from backend.ai.extractor import extract_from_multipage
 from backend.queue.redis_queue import (
     is_url_scraped,
     mark_url_scraped,
@@ -59,6 +59,14 @@ async def _update_job(job_id: str, **kwargs) -> None:
         pass  # Redis optional; in-memory already updated
 
 
+def _coerce_str_list(val) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [s.strip() for s in val.replace(";", ",").split(",") if s.strip()]
+    return [str(x).strip() for x in val if x and str(x).strip()]
+
+
 def _build_agency_row(apify_item: dict, extracted: dict, city: str, country: str, level: int) -> dict:
     def _to_list(val) -> list[str] | None:
         if not val:
@@ -104,6 +112,33 @@ def _build_agency_row(apify_item: dict, extracted: dict, city: str, country: str
     }
 
 
+def _opt_int(val) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _furnished_text(val) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    s = str(val).strip()
+    return s or None
+
+
 def _build_property_row(prop: dict, agency_id, city: str, country: str) -> dict:
     listing_date = None
     raw_date = prop.get("listing_date")
@@ -120,6 +155,23 @@ def _build_property_row(prop: dict, agency_id, city: str, country: str) -> dict:
     amenities = prop.get("amenities") or []
     if isinstance(amenities, str):
         amenities = [a.strip() for a in amenities.split(",") if a.strip()]
+    features = prop.get("features") or []
+    if isinstance(features, str):
+        features = [features]
+    if isinstance(features, list):
+        amenities = [*amenities, *[str(x).strip() for x in features if x]]
+    amenities = list(dict.fromkeys([a for a in amenities if a]))[:80] or None
+
+    raw_desc = prop.get("description")
+    meta_lines: list[str] = []
+    for k in ("price_type",):
+        v = prop.get(k)
+        if v is not None and str(v).strip():
+            meta_lines.append(f"{k}: {v}")
+    description = raw_desc
+    if meta_lines:
+        suffix = "\n\n" + "\n".join(meta_lines)
+        description = ((raw_desc or "") + suffix).strip()[:12000]
 
     price = prop.get("price")
     total_sqm = prop.get("total_sqm")
@@ -127,17 +179,38 @@ def _build_property_row(prop: dict, agency_id, city: str, country: str) -> dict:
     if price and total_sqm and not price_per_sqm and total_sqm > 0:
         price_per_sqm = round(float(price) / float(total_sqm), 2)
 
+    baths = prop.get("bathrooms")
+    if baths is None:
+        baths = prop.get("bathroom_count")
+
+    listing_reference = prop.get("listing_reference") or prop.get("reference")
+    virtual_tour_url = prop.get("virtual_tour_url") or prop.get("virtual_tour")
+    floor_raw = prop.get("floor_number")
+    if floor_raw is None:
+        floor_raw = prop.get("floor")
+
     return {
         "agency_id": agency_id,
         "title": prop.get("title"),
         "property_type": prop.get("property_type"),
-        "description": prop.get("description"),
+        "category": prop.get("category"),
+        "description": description,
         "images": images or None,
         "bedrooms": prop.get("bedrooms"),
-        "bathroom_count": prop.get("bathrooms"),
+        "bathroom_count": baths,
         "bedroom_sqm": prop.get("bedroom_sqm"),
         "bathroom_sqm": prop.get("bathroom_sqm"),
         "total_sqm": total_sqm,
+        "plot_sqm": _opt_float(prop.get("plot_sqm")),
+        "furnished": _furnished_text(prop.get("furnished")),
+        "floor_number": _opt_int(floor_raw),
+        "total_floors": _opt_int(prop.get("total_floors")),
+        "year_built": _opt_int(prop.get("year_built")),
+        "condition": prop.get("condition"),
+        "energy_rating": prop.get("energy_rating"),
+        "virtual_tour_url": virtual_tour_url,
+        "listing_reference": listing_reference,
+        "full_address": prop.get("full_address"),
         "price": price,
         "price_per_sqm": price_per_sqm,
         "currency": prop.get("currency") or "EUR",
@@ -148,7 +221,8 @@ def _build_property_row(prop: dict, agency_id, city: str, country: str) -> dict:
         "latitude": prop.get("latitude"),
         "longitude": prop.get("longitude"),
         "listing_date": listing_date,
-        "amenities": amenities or None,
+        "amenities": amenities,
+        "listing_url": prop.get("listing_url"),
     }
 
 
@@ -158,6 +232,7 @@ def _build_property_row(prop: dict, agency_id, city: str, country: str) -> dict:
 
 async def _run_pipeline(job_id: str, city: str, country: str) -> None:
     engine = ScraperEngine()
+    multipage = MultiPageScraper(engine)
     await _update_job(job_id, status="running", message="Discovering agencies via Apify…")
 
     # Step 1 — Discover (apify_client SDK is synchronous, run in thread pool)
@@ -190,23 +265,31 @@ async def _run_pipeline(job_id: str, city: str, country: str) -> None:
                 logger.info("Skipping already-scraped: %s", url)
                 continue
 
-            # Step 2 — Scrape the agency website (layered engine)
-            scrape_result = await engine.scrape(url)
-            if not scrape_result["success"] or not scrape_result.get("html"):
-                logger.warning("Scrape failed for %s", url)
+            # Step 2–3 — Multi-page crawl (homepage + listings index + property detail pages) + AI extraction
+            bundle = await multipage.scrape_agency_complete(url)
+            if not bundle.get("success") or not bundle.get("homepage_html"):
+                logger.warning("Multi-page scrape failed for %s", url)
                 continue
 
-            # Step 3 — AI extraction
-            extracted = await extract_data(scrape_result["html"], url)
+            extracted = await extract_from_multipage(bundle, url)
+
+            props_merged = [p for p in (extracted.get("properties") or []) if isinstance(p, dict)]
+
+            cats: set[str] = set(_coerce_str_list(extracted.get("property_categories")))
+            for p in props_merged:
+                for key in ("category", "property_type"):
+                    v = p.get(key)
+                    if v:
+                        cats.add(str(v).strip())
 
             # Step 4 — Persist to Supabase
             try:
-                agency_row = _build_agency_row(item, extracted, city, country, scrape_result["level"])
+                agency_row = _build_agency_row(item, extracted, city, country, bundle.get("max_level") or 1)
+                agency_row["total_listings"] = len(props_merged)
+                agency_row["property_categories"] = sorted(cats) if cats else None
                 agency = await crud.upsert_agency(db, agency_row)
 
-                for prop in (extracted.get("properties") or []):
-                    if not isinstance(prop, dict):
-                        continue
+                for prop in props_merged:
                     await crud.create_property(db, _build_property_row(prop, agency.id, city, country))
 
                 await mark_url_scraped(url)
@@ -227,18 +310,13 @@ async def _run_pipeline(job_id: str, city: str, country: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@router.post("", response_model=ScrapeStatus, status_code=202)
-async def start_scrape(payload: ScrapeRequest, background_tasks: BackgroundTasks):
+async def enqueue_scrape_job(city: str, country: str, background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     job = {
         "job_id": job_id,
         "status": "queued",
-        "city": payload.city,
-        "country": payload.country,
+        "city": city,
+        "country": country,
         "agencies_found": 0,
         "agencies_scraped": 0,
         "message": "Job queued",
@@ -249,8 +327,17 @@ async def start_scrape(payload: ScrapeRequest, background_tasks: BackgroundTasks
     except Exception:
         pass
 
-    background_tasks.add_task(_run_pipeline, job_id, payload.city, payload.country)
+    background_tasks.add_task(_run_pipeline, job_id, city, country)
     return job
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("", response_model=ScrapeStatus, status_code=202)
+async def start_scrape(payload: ScrapeRequest, background_tasks: BackgroundTasks):
+    return await enqueue_scrape_job(payload.city, payload.country, background_tasks)
 
 
 @router.get("/{job_id}", response_model=ScrapeStatus)
