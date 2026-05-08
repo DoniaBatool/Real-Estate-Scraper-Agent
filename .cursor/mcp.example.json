@@ -1,0 +1,5 @@
+{
+  "supabase": {
+    "accessToken": "YOUR_SUPABASE_PAT_HERE"
+  }
+}
