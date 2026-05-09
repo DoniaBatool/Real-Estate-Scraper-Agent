@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, ReactNode, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Bot, Loader2, MoreVertical, Pencil, Plus, Send, Trash2, User } from "lucide-react";
+import { Bot, Loader2, Mic, MicOff, MoreVertical, Pencil, Plus, Send, Trash2, User } from "lucide-react";
 import {
   clearAllChatThreads,
   createChatThread,
@@ -265,6 +265,26 @@ const ARIA_TYPING_STATUS = [
   "🏢 ARIA is loading agency profile...",
 ];
 
+const TYPING_BY_ACTION: Record<string, string> = {
+  conversation: "ARIA is responding...",
+  search_database: "🔍 Searching database...",
+  scrape_city: "🌐 Visiting agency websites... (2-3 min)",
+  web_search: "🔎 Searching the web...",
+  get_pricing_analysis: "📊 Analyzing pricing data...",
+  compare_properties: "🧾 Comparing properties...",
+  get_area_pricing: "📍 Checking area pricing...",
+};
+
+function inferTypingAction(text: string): string {
+  const msg = text.toLowerCase();
+  const casual = ["thanks", "thank you", "hello", "hi", "hey", "how are you", "great", "amazing"];
+  if (casual.some((w) => msg.includes(w)) && msg.length < 90) return "conversation";
+  if (msg.includes("scrape") || msg.includes("agency website") || msg.includes("agencies in")) return "scrape_city";
+  if (msg.includes("trend") || msg.includes("news") || msg.includes("market")) return "web_search";
+  if (msg.includes("price") || msg.includes("pricing") || msg.includes("per sqm") || msg.includes("avg")) return "get_pricing_analysis";
+  return "search_database";
+}
+
 function ChatStructuredMeta({ meta }: { meta: Record<string, unknown> }) {
   const display = meta.display;
   if (display === "agency_table" && Array.isArray(meta.rows) && Array.isArray(meta.columns)) {
@@ -282,6 +302,35 @@ function ChatStructuredMeta({ meta }: { meta: Record<string, unknown> }) {
   return null;
 }
 
+function ChatCompareBlock({ payload }: { payload: Record<string, unknown> }) {
+  const rows = Array.isArray(payload.comparison_table) ? (payload.comparison_table as Array<Record<string, unknown>>) : [];
+  const recommendation = typeof payload.recommendation === "string" ? payload.recommendation : "";
+  if (!rows.length && !recommendation) return null;
+  return (
+    <div style={{ marginTop: "0.6rem", border: "1px solid rgba(148,163,184,0.25)", borderRadius: 10, overflow: "hidden" }}>
+      {rows.length > 0 && (
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.76rem" }}>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i} style={{ borderTop: i ? "1px solid rgba(148,163,184,0.12)" : "none" }}>
+                <td style={{ padding: "0.45rem 0.6rem", color: "var(--text-muted)", minWidth: 120 }}>{String(r.criteria ?? "Criteria")}</td>
+                <td style={{ padding: "0.45rem 0.6rem", color: "var(--text-secondary)" }}>
+                  {Array.isArray(r.values) ? r.values.join(" | ") : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {recommendation && (
+        <div style={{ borderTop: "1px solid rgba(226,181,90,0.25)", padding: "0.5rem 0.6rem", color: "var(--accent-gold)", fontSize: "0.75rem" }}>
+          Recommendation: {recommendation}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ChatPageContent() {
   const searchParams = useSearchParams();
   const [input, setInput] = useState("");
@@ -290,14 +339,33 @@ function ChatPageContent() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
   const [typingStatusIdx, setTypingStatusIdx] = useState(0);
+  const [pendingActionHint, setPendingActionHint] = useState<string>("search_database");
+  const [userFingerprint, setUserFingerprint] = useState<string>("");
+  const [welcomeBackSummary, setWelcomeBackSummary] = useState<string>("");
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [menuThreadId, setMenuThreadId] = useState<string>("");
   const [pageError, setPageError] = useState("");
   const [renameTarget, setRenameTarget] = useState<ChatThread | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [voiceListening, setVoiceListening] = useState(false);
+
+  const submitUserMessageRef = useRef<(text: string) => Promise<void>>(async () => {});
+  const sendingRef = useRef(sending);
+  const activeThreadIdRef = useRef(activeThreadId);
+  const voiceRecognitionRef = useRef<SpeechRecognition | null>(null);
+  const voiceDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceTranscriptRef = useRef("");
 
   const canSend = useMemo(() => input.trim().length > 0 && !sending, [input, sending]);
+
+  useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
+
+  useEffect(() => {
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
 
   const refreshThreads = useCallback(async () => {
     const items = await listChatThreads();
@@ -307,6 +375,18 @@ function ChatPageContent() {
       return items[0]?.id ?? "";
     });
     return items;
+  }, []);
+
+  useEffect(() => {
+    const getUserFingerprint = () => {
+      let fp = localStorage.getItem("aria_user_fp");
+      if (!fp) {
+        fp = `user_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+        localStorage.setItem("aria_user_fp", fp);
+      }
+      return fp;
+    };
+    setUserFingerprint(getUserFingerprint());
   }, []);
 
   useEffect(() => {
@@ -488,55 +568,151 @@ function ChatPageContent() {
     }
   };
 
+  const stopVoiceDebounce = useCallback(() => {
+    if (voiceDebounceRef.current) {
+      clearTimeout(voiceDebounceRef.current);
+      voiceDebounceRef.current = null;
+    }
+  }, []);
+
+  const submitUserMessage = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || sending || !activeThreadId) return;
+
+      const wasEmpty = messages.length === 0;
+
+      setInput("");
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `u-${Date.now()}`,
+          thread_id: activeThreadId,
+          role: "user",
+          content: trimmed,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+      setPendingActionHint(inferTypingAction(trimmed));
+      setSending(true);
+
+      try {
+        const res = await sendThreadMessage(activeThreadId, trimmed, userFingerprint || undefined);
+        if (typeof res.action === "string" && res.action) {
+          setPendingActionHint(res.action);
+        }
+        const mm =
+          res.message_meta && typeof res.message_meta === "object" ? (res.message_meta as Record<string, unknown>) : {};
+        if (wasEmpty && mm.is_returning_user && typeof mm.memory_summary === "string" && mm.memory_summary.trim()) {
+          setWelcomeBackSummary(mm.memory_summary.trim());
+        }
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a-${Date.now()}`,
+            thread_id: activeThreadId,
+            role: "assistant",
+            content: res.reply,
+            created_at: new Date().toISOString(),
+            meta: { action: res.action, ...(res.message_meta && typeof res.message_meta === "object" ? res.message_meta : {}) },
+          },
+        ]);
+        if (res.job?.job_id) {
+          void watchJob(res.job.job_id, res.job.city, res.job.country);
+        }
+        await refreshThreads();
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `e-${Date.now()}`,
+            thread_id: activeThreadId,
+            role: "assistant",
+            content: "Unable to reach backend right now. Please check backend server and try again.",
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      } finally {
+        setSending(false);
+      }
+    },
+    [
+      activeThreadId,
+      messages.length,
+      refreshThreads,
+      sending,
+      userFingerprint,
+      watchJob,
+    ],
+  );
+
+  useEffect(() => {
+    submitUserMessageRef.current = submitUserMessage;
+  }, [submitUserMessage]);
+
+  useEffect(() => {
+    return () => {
+      stopVoiceDebounce();
+      voiceRecognitionRef.current?.stop();
+    };
+  }, [stopVoiceDebounce]);
+
+  const toggleChatVoiceInput = () => {
+    if (voiceListening) {
+      voiceRecognitionRef.current?.stop();
+      stopVoiceDebounce();
+      setVoiceListening(false);
+      return;
+    }
+
+    const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Ctor) {
+      alert("Voice not supported in this browser. Try Chrome.");
+      return;
+    }
+    if (!activeThreadId || sending) return;
+
+    voiceTranscriptRef.current = "";
+    setVoiceListening(true);
+
+    const recognition = new Ctor();
+    voiceRecognitionRef.current = recognition;
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      const next = Array.from(event.results)
+        .map((r) => r[0].transcript)
+        .join("");
+      voiceTranscriptRef.current = next;
+      setInput(next);
+      stopVoiceDebounce();
+      voiceDebounceRef.current = setTimeout(() => {
+        const t = voiceTranscriptRef.current.trim();
+        if (t && !sendingRef.current && activeThreadIdRef.current) {
+          voiceRecognitionRef.current?.stop();
+          void submitUserMessageRef.current(t);
+        }
+        voiceDebounceRef.current = null;
+      }, 1000);
+    };
+
+    recognition.onerror = () => {
+      setVoiceListening(false);
+      stopVoiceDebounce();
+    };
+
+    recognition.onend = () => {
+      setVoiceListening(false);
+    };
+
+    recognition.start();
+  };
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    const text = input.trim();
-    if (!text || sending || !activeThreadId) return;
-
-    setInput("");
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `u-${Date.now()}`,
-        thread_id: activeThreadId,
-        role: "user",
-        content: text,
-        created_at: new Date().toISOString(),
-      },
-    ]);
-    setSending(true);
-
-    try {
-      const res = await sendThreadMessage(activeThreadId, text);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          thread_id: activeThreadId,
-          role: "assistant",
-          content: res.reply,
-          created_at: new Date().toISOString(),
-          meta: { action: res.action, ...(res.message_meta && typeof res.message_meta === "object" ? res.message_meta : {}) },
-        },
-      ]);
-      if (res.job?.job_id) {
-        void watchJob(res.job.job_id, res.job.city, res.job.country);
-      }
-      await refreshThreads();
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `e-${Date.now()}`,
-          thread_id: activeThreadId,
-          role: "assistant",
-          content: "Unable to reach backend right now. Please check backend server and try again.",
-          created_at: new Date().toISOString(),
-        },
-      ]);
-    } finally {
-      setSending(false);
-    }
+    await submitUserMessage(input);
   };
 
   return (
@@ -739,6 +915,21 @@ function ChatPageContent() {
           {pageError && (
             <div style={{ marginBottom: "0.6rem", color: "#fda4af", fontSize: "0.78rem" }}>{pageError}</div>
           )}
+          {!!welcomeBackSummary && (
+            <div
+              style={{
+                marginBottom: "0.6rem",
+                border: "1px solid rgba(226,181,90,0.35)",
+                background: "rgba(226,181,90,0.1)",
+                color: "var(--accent-gold)",
+                borderRadius: 10,
+                padding: "0.5rem 0.65rem",
+                fontSize: "0.78rem",
+              }}
+            >
+              Welcome back! {welcomeBackSummary}
+            </div>
+          )}
 
           <div
             className="card chat-scroll"
@@ -819,6 +1010,11 @@ function ChatPageContent() {
                     {m.role === "assistant" && m.meta && typeof m.meta.display === "string" && (
                       <ChatStructuredMeta meta={m.meta as Record<string, unknown>} />
                     )}
+                    {m.role === "assistant" &&
+                      m.meta &&
+                      (m.meta as { compare_result?: Record<string, unknown> }).compare_result && (
+                        <ChatCompareBlock payload={(m.meta as { compare_result: Record<string, unknown> }).compare_result} />
+                      )}
                   </div>
                 </div>
                 {m.role === "assistant" && m.meta && typeof (m.meta as { aria_actions_line?: string }).aria_actions_line === "string" && (
@@ -873,50 +1069,68 @@ function ChatPageContent() {
                       lineHeight: 1.35,
                     }}
                   >
-                    {ARIA_TYPING_STATUS[typingStatusIdx]}
+                    {TYPING_BY_ACTION[pendingActionHint] ?? ARIA_TYPING_STATUS[typingStatusIdx]}
                   </span>
                 </div>
               </div>
             )}
           </div>
 
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginBottom: "0.5rem" }}>
-            {ARIA_SUGGESTIONS.map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setInput(s)}
+          <form onSubmit={onSubmit} style={{ display: "flex", gap: "0.5rem", alignItems: "stretch" }}>
+            <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center" }}>
+              {voiceListening && (
+                <span
+                  title="Listening…"
+                  style={{
+                    position: "absolute",
+                    left: 12,
+                    width: 8,
+                    height: 8,
+                    borderRadius: 999,
+                    background: "var(--red)",
+                    animation: "voicePulse 1.2s ease-in-out infinite",
+                    pointerEvents: "none",
+                  }}
+                />
+              )}
+              <input
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Ask ARIA — properties, agencies, pricing, or scrape a city…"
                 style={{
-                  fontSize: "0.68rem",
-                  padding: "0.28rem 0.5rem",
-                  borderRadius: 6,
-                  border: "1px solid rgba(148,163,184,0.25)",
-                  background: "rgba(15,23,42,0.5)",
-                  color: "var(--text-muted)",
-                  cursor: "pointer",
-                  maxWidth: "100%",
-                  textAlign: "left",
+                  flex: 1,
+                  width: "100%",
+                  background: "rgba(255,255,255,0.04)",
+                  border: `1px solid ${voiceListening ? "rgba(239,68,68,0.45)" : "var(--border)"}`,
+                  borderRadius: 10,
+                  color: "var(--text-primary)",
+                  padding: voiceListening ? "0.75rem 0.9rem 0.75rem 1.85rem" : "0.75rem 0.9rem",
+                  fontSize: "0.88rem",
+                  boxShadow: voiceListening ? "0 0 0 1px rgba(239,68,68,0.12)" : undefined,
                 }}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-          <form onSubmit={onSubmit} style={{ display: "flex", gap: "0.5rem" }}>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask ARIA — properties, agencies, pricing, or scrape a city…"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={toggleChatVoiceInput}
+              disabled={sending || !activeThreadId}
+              title={voiceListening ? "Stop voice input" : "Voice input"}
               style={{
-                flex: 1,
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid var(--border)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
                 borderRadius: 10,
-                color: "var(--text-primary)",
-                padding: "0.75rem 0.9rem",
-                fontSize: "0.88rem",
+                border: `1px solid ${voiceListening ? "rgba(239,68,68,0.5)" : "rgba(148,163,184,0.35)"}`,
+                padding: "0 0.85rem",
+                background: voiceListening ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.04)",
+                color: "#fff",
+                cursor: sending || !activeThreadId ? "not-allowed" : "pointer",
+                opacity: sending || !activeThreadId ? 0.5 : 1,
               }}
-            />
+            >
+              {voiceListening ? <MicOff size={18} /> : <Mic size={18} />}
+            </button>
             <button
               type="submit"
               disabled={!canSend}
@@ -956,6 +1170,10 @@ function ChatPageContent() {
         @keyframes typingBounce {
           0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
           40% { transform: translateY(-3px); opacity: 1; }
+        }
+        @keyframes voicePulse {
+          0%, 100% { transform: scale(1); opacity: 1; }
+          50% { transform: scale(1.25); opacity: 0.65; }
         }
       `}</style>
       {renameTarget && (

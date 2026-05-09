@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState, useMemo, type CSSProperties, Fragment } from "react";
+import { useState, useMemo, useRef, useEffect, type CSSProperties, Fragment } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -19,9 +19,11 @@ import {
   MapPin,
   MessageCircle,
   Share2,
+  ChevronDown,
 } from "lucide-react";
 
 const col = createColumnHelper<Property>();
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 function fmtNum(n?: number | null, dec = 0) {
   if (n == null || !Number.isFinite(Number(n))) return "—";
@@ -159,6 +161,106 @@ type SortMode =
   | "ppm_desc"
   | "date_asc"
   | "date_desc";
+
+type SelectOption = { value: string; label: string };
+
+function ThemeSelect({
+  value,
+  onChange,
+  options,
+  minWidth,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: SelectOption[];
+  minWidth?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!rootRef.current?.contains(t)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  const selected = options.find((o) => o.value === value) ?? options[0];
+
+  return (
+    <div ref={rootRef} style={{ position: "relative", minWidth }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          color: "var(--text-primary)",
+          padding: "0.5rem 0.65rem",
+          fontSize: "0.78rem",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          minWidth,
+          width: "100%",
+          cursor: "pointer",
+        }}
+      >
+        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textAlign: "left" }}>{selected?.label}</span>
+        <ChevronDown size={14} color="var(--text-muted)" />
+      </button>
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            minWidth: "100%",
+            maxHeight: 240,
+            overflowY: "auto",
+            zIndex: 40,
+            borderRadius: 10,
+            border: "1px solid rgba(148,163,184,0.24)",
+            background: "#0f1728",
+            boxShadow: "0 14px 34px rgba(0,0,0,0.42)",
+            padding: 4,
+          }}
+        >
+          {options.map((o) => {
+            const active = o.value === value;
+            return (
+              <button
+                key={`${o.value}-${o.label}`}
+                type="button"
+                onClick={() => {
+                  onChange(o.value);
+                  setOpen(false);
+                }}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "0.4rem 0.5rem",
+                  fontSize: "0.76rem",
+                  cursor: "pointer",
+                  color: active ? "#dbeafe" : "var(--text-secondary)",
+                  background: active ? "rgba(37,99,235,0.2)" : "transparent",
+                }}
+              >
+                {o.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function sortRows(rows: Property[], mode: SortMode): Property[] {
   const copy = [...rows];
@@ -807,6 +909,26 @@ export default function PropertyTable({
                 <MessageCircle size={14} />
                 Ask ARIA
               </Link>
+              <a
+                href={`${API_BASE}/api/properties/${p.id}/report`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: 8,
+                  border: "1px solid rgba(148,163,184,0.25)",
+                  background: "rgba(255,255,255,0.04)",
+                  color: "var(--text-secondary)",
+                  fontSize: "0.72rem",
+                  textDecoration: "none",
+                }}
+              >
+                📄 Report
+              </a>
               {p.images && p.images.length > 1 && (
                 <button
                   type="button"
@@ -1043,47 +1165,43 @@ export default function PropertyTable({
             onChange={(e) => setGlobalFilter(e.target.value)}
             style={{ ...inputStyle, flex: "1 1 220px", minWidth: 200 }}
           />
-          <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} style={{ ...inputStyle, minWidth: 120 }}>
-            <option value="">All types</option>
-            {types.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-          <select
+          <ThemeSelect
+            value={typeFilter}
+            onChange={setTypeFilter}
+            minWidth={120}
+            options={[
+              { value: "", label: "All types" },
+              ...types.map((t) => ({ value: t, label: t })),
+            ]}
+          />
+          <ThemeSelect
             value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
-            style={{ ...inputStyle, minWidth: 130 }}
-          >
-            <option value="">All categories</option>
-            {categories.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <select
+            onChange={setCategoryFilter}
+            minWidth={130}
+            options={[
+              { value: "", label: "All categories" },
+              ...categories.map((c) => ({ value: c, label: c })),
+            ]}
+          />
+          <ThemeSelect
             value={bedroomsFilter}
-            onChange={(e) => setBedroomsFilter(e.target.value)}
-            style={{ ...inputStyle, minWidth: 110 }}
-          >
-            <option value="">Any beds</option>
-            {bedOptions.map((b) => (
-              <option key={b} value={String(b)}>
-                {b} bed{b !== 1 ? "s" : ""}
-              </option>
-            ))}
-          </select>
-          <select
+            onChange={setBedroomsFilter}
+            minWidth={110}
+            options={[
+              { value: "", label: "Any beds" },
+              ...bedOptions.map((b) => ({ value: String(b), label: `${b} bed${b !== 1 ? "s" : ""}` })),
+            ]}
+          />
+          <ThemeSelect
             value={furnishedFilter}
-            onChange={(e) => setFurnishedFilter(e.target.value as "" | "furnished" | "unfurnished")}
-            style={{ ...inputStyle, minWidth: 130 }}
-          >
-            <option value="">All furnished</option>
-            <option value="furnished">Furnished</option>
-            <option value="unfurnished">Unfurnished</option>
-          </select>
+            onChange={(v) => setFurnishedFilter(v as "" | "furnished" | "unfurnished")}
+            minWidth={130}
+            options={[
+              { value: "", label: "All furnished" },
+              { value: "furnished", label: "Furnished" },
+              { value: "unfurnished", label: "Unfurnished" },
+            ]}
+          />
           <input
             placeholder="Locality"
             value={localityFilter}
@@ -1118,16 +1236,21 @@ export default function PropertyTable({
             onChange={(e) => setMaxSqm(e.target.value)}
             style={{ ...inputStyle, width: 88 }}
           />
-          <select value={sortMode} onChange={(e) => setSortMode(e.target.value as SortMode)} style={{ ...inputStyle, minWidth: 160 }}>
-            <option value="price_asc">Sort: Price ↑</option>
-            <option value="price_desc">Sort: Price ↓</option>
-            <option value="size_asc">Sort: Size ↑</option>
-            <option value="size_desc">Sort: Size ↓</option>
-            <option value="ppm_asc">Sort: Price/m² ↑</option>
-            <option value="ppm_desc">Sort: Price/m² ↓</option>
-            <option value="date_asc">Sort: Date ↑</option>
-            <option value="date_desc">Sort: Date ↓</option>
-          </select>
+          <ThemeSelect
+            value={sortMode}
+            onChange={(v) => setSortMode(v as SortMode)}
+            minWidth={160}
+            options={[
+              { value: "price_asc", label: "Sort: Price ↑" },
+              { value: "price_desc", label: "Sort: Price ↓" },
+              { value: "size_asc", label: "Sort: Size ↑" },
+              { value: "size_desc", label: "Sort: Size ↓" },
+              { value: "ppm_asc", label: "Sort: Price/m² ↑" },
+              { value: "ppm_desc", label: "Sort: Price/m² ↓" },
+              { value: "date_asc", label: "Sort: Date ↑" },
+              { value: "date_desc", label: "Sort: Date ↓" },
+            ]}
+          />
           <div style={{ marginLeft: "auto", display: "flex", flexWrap: "wrap", gap: "0.5rem", alignItems: "center" }}>
             <button
               type="button"

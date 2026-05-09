@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, date
 from sqlalchemy import (
     Column, String, Float, Integer, Text, ARRAY,
-    ForeignKey, DateTime, Date, Boolean,
+    ForeignKey, DateTime, Date, Boolean, JSON,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -149,3 +149,42 @@ class ChatToolRun(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
 
     thread = relationship("ChatThread", back_populates="tool_runs")
+
+
+class UserMemory(Base):
+    __tablename__ = "user_memory"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String)
+    user_fingerprint = Column(String, index=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    preferred_cities = Column(ARRAY(String))
+    preferred_countries = Column(ARRAY(String))
+    preferred_property_types = Column(ARRAY(String))
+    min_budget = Column(Float)
+    max_budget = Column(Float)
+    currency = Column(String)
+    min_bedrooms = Column(Integer)
+    preferred_localities = Column(ARRAY(String))
+    investment_interest = Column(Boolean, default=False)
+    rental_interest = Column(Boolean, default=False)
+    language = Column(String, default="english")
+
+    total_conversations = Column(Integer, default=0)
+    last_seen = Column(DateTime(timezone=True), default=datetime.utcnow)
+    summary = Column(Text)
+    raw_preferences = Column(JSON)
+
+
+class ConversationEmbedding(Base):
+    __tablename__ = "conversation_embeddings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String)
+    user_fingerprint = Column(String, index=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    message = Column(Text)
+    role = Column(String)
+    metadata_ = Column("metadata", JSON)

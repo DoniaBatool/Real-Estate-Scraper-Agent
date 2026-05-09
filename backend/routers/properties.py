@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, Query
+import io
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from datetime import datetime, date
@@ -6,6 +9,7 @@ from uuid import UUID
 from typing import Optional
 from backend.database.connection import get_db
 from backend.database import crud
+from backend.reports.generator import generate_property_pdf
 
 router = APIRouter(prefix="/api/properties", tags=["properties"])
 
@@ -81,4 +85,28 @@ async def list_properties(
         order=order,
         page=page,
         limit=limit,
+    )
+
+
+@router.get("/{property_id}/report")
+async def download_property_report(
+    property_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    prop = await crud.get_property_by_id(db, property_id)
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    agency = await crud.get_agency_by_id(db, str(prop.agency_id)) if prop.agency_id else None
+    pricing = await crud.get_locality_pricing(db, prop.locality or "")
+    pdf_bytes = await generate_property_pdf(
+        prop.__dict__,
+        agency.__dict__ if agency else None,
+        pricing,
+    )
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=property_report_{property_id}.pdf"
+        },
     )

@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --bg-base: #0a0f1a;
   --bg-card: #0f1728;
@@ -117,6 +121,28 @@ body {
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
 }
 
+/* Themed selects (Properties filters dropdowns) */
+.theme-select {
+  color-scheme: dark;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #64748b 50%),
+    linear-gradient(135deg, #64748b 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) calc(50% - 2px),
+    calc(100% - 9px) calc(50% - 2px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.8rem !important;
+}
+
+.theme-select option {
+  background: #0f1728;
+  color: #e2e8f0;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -162,4 +188,13 @@ body {
   height: 2px;
   background: linear-gradient(90deg, var(--accent-gold), transparent);
   border-radius: 1px;
+}
+
+/* Homepage horizontal slideshow — hide scrollbar, keep drag/wheel */
+.home-horizontal-slides {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.home-horizontal-slides::-webkit-scrollbar {
+  display: none;
 }

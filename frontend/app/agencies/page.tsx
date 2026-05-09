@@ -9,15 +9,34 @@ import { Loader2, Building2 } from "lucide-react";
 
 export default function AgenciesPage() {
   const [agencies, setAgencies] = useState<Agency[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [filters, setFilters] = useState<AgencyFilters>({ page: 1, limit: 50 });
+  const [filters, setFilters] = useState<AgencyFilters>({});
   const [deleteTarget, setDeleteTarget] = useState<Agency | null>(null);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
-    getAgencies(filters)
-      .then(setAgencies)
+    const load = async () => {
+      const limit = 100;
+      let page = 1;
+      const all: Agency[] = [];
+      while (true) {
+        const chunk = await getAgencies({ ...filters, page, limit });
+        all.push(...chunk);
+        if (chunk.length < limit) break;
+        page += 1;
+      }
+      return all;
+    };
+
+    setLoading(true);
+    load()
+      .then((rows) => {
+        setAgencies(rows);
+        setTotalCount(rows.length);
+      })
       .catch(() => setError("Failed to load agencies"))
       .finally(() => setLoading(false));
   }, [filters]);
@@ -45,6 +64,21 @@ export default function AgenciesPage() {
     }
   };
 
+  const confirmDeleteAllAgencies = async () => {
+    if (deleting || agencies.length === 0) return;
+    setDeleting(true);
+    try {
+      await Promise.all(agencies.map((a) => deleteAgency(a.id)));
+      setAgencies([]);
+      setTotalCount(0);
+      setConfirmDeleteAll(false);
+    } catch {
+      setError("Failed to delete all agencies");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <div style={{ minHeight: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "2.5rem 1.5rem" }}>
       <div style={{ maxWidth: 1280, margin: "0 auto" }}>
@@ -60,9 +94,9 @@ export default function AgenciesPage() {
             <h1 style={{ fontSize: "1.75rem", fontWeight: 800, color: "var(--text-primary)", letterSpacing: "-0.02em" }}>
               Agencies
             </h1>
-            {agencies.length > 0 && (
+            {totalCount > 0 && (
               <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginTop: 2 }}>
-                {agencies.length} agencies found
+                {totalCount} agencies found
               </p>
             )}
           </div>
@@ -93,6 +127,23 @@ export default function AgenciesPage() {
               }}
               style={{ ...inputStyle, width: 120 }}
             />
+            <button
+              type="button"
+              onClick={() => setConfirmDeleteAll(true)}
+              disabled={loading || agencies.length === 0}
+              style={{
+                borderRadius: 8,
+                border: "1px solid rgba(239,68,68,0.35)",
+                background: agencies.length ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.04)",
+                color: agencies.length ? "#fda4af" : "var(--text-muted)",
+                padding: "0.5rem 0.8rem",
+                fontSize: "0.78rem",
+                fontWeight: 600,
+                cursor: agencies.length ? "pointer" : "not-allowed",
+              }}
+            >
+              Delete All
+            </button>
           </div>
         </div>
 
@@ -198,6 +249,74 @@ export default function AgenciesPage() {
                 }}
               >
                 {deleting ? "Deleting..." : "Yes, Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmDeleteAll && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 120,
+            background: "rgba(2,6,23,0.7)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "1rem",
+          }}
+        >
+          <div
+            className="card gradient-border"
+            style={{
+              width: "min(500px, 100%)",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              padding: "1rem 1rem 0.95rem",
+              background: "var(--bg-card)",
+            }}
+          >
+            <h3 style={{ color: "var(--text-primary)", fontSize: "1rem", fontWeight: 700, marginBottom: 8 }}>
+              Delete All Agencies
+            </h3>
+            <p style={{ color: "var(--text-secondary)", fontSize: "0.86rem", lineHeight: 1.55 }}>
+              Are you sure you want to delete all visible agency cards ({agencies.length})? This will remove agencies and
+              related properties from the database.
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteAll(false)}
+                disabled={deleting}
+                style={{
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "rgba(255,255,255,0.04)",
+                  color: "var(--text-secondary)",
+                  padding: "0.45rem 0.9rem",
+                  fontSize: "0.8rem",
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteAllAgencies}
+                disabled={deleting}
+                style={{
+                  borderRadius: 8,
+                  border: "1px solid rgba(239,68,68,0.4)",
+                  background: "rgba(239,68,68,0.15)",
+                  color: "#fda4af",
+                  padding: "0.45rem 0.9rem",
+                  fontSize: "0.8rem",
+                  cursor: "pointer",
+                }}
+              >
+                {deleting ? "Deleting..." : "Yes, Delete All"}
               </button>
             </div>
           </div>

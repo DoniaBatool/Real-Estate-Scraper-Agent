@@ -66,6 +66,7 @@ class ClearAllThreadsResponse(BaseModel):
 
 class ChatMessageRequest(BaseModel):
     message: str
+    user_fingerprint: str = ""
 
 
 class ChatReplyOut(BaseModel):
@@ -642,7 +643,14 @@ async def send_message(
         try:
             from backend.ai.aria_agent import run_aria_turn
 
-            reply_ar, meta_ar, action_ar = await run_aria_turn(db, text, messages)
+            fingerprint = payload.user_fingerprint.strip() or thread_id
+            reply_ar, meta_ar, action_ar = await run_aria_turn(
+                db,
+                text,
+                messages,
+                user_fingerprint=fingerprint,
+                session_id=thread_id,
+            )
             merged_ar = {**meta_ar, "action": action_ar}
             await crud.create_chat_message(db, thread_id, "assistant", reply_ar, meta=merged_ar)
             return ChatReplyOut(

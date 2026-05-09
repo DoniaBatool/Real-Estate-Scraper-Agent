@@ -1,7 +1,7 @@
 """CRUD operations for agencies and properties."""
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from backend.database.models import (
     Agency,
     Property,
@@ -144,6 +144,37 @@ async def create_property(db: AsyncSession, data: dict) -> Property:
     await db.commit()
     await db.refresh(prop)
     return prop
+
+
+async def get_property_by_id(db: AsyncSession, property_id: str) -> Property | None:
+    result = await db.execute(select(Property).where(Property.id == property_id))
+    return result.scalar_one_or_none()
+
+
+async def get_locality_pricing(db: AsyncSession, locality: str) -> dict:
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                locality,
+                COUNT(*) as count,
+                AVG(price_per_sqm) as avg_price_per_sqm,
+                AVG(total_sqm) as avg_size,
+                MIN(price) as min_price,
+                MAX(price) as max_price,
+                AVG(price) as avg_price
+            FROM properties
+            WHERE locality ILIKE :locality
+            AND price_per_sqm IS NOT NULL
+            GROUP BY locality
+            """
+        ),
+        {"locality": f"%{locality}%"},
+    )
+    row = result.fetchone()
+    if row:
+        return dict(row._mapping)
+    return {}
 
 
 async def delete_agency(db: AsyncSession, agency_id: str) -> bool:
@@ -381,8 +412,9 @@ async def get_pricing_data(
     city: str | None = None,
     country: str | None = None,
     property_type: str | None = None,
+    category: str | None = None,
 ) -> dict:
-    """Same aggregates as GET /api/pricing; optional filter by property_type."""
+    """Same aggregates as GET /api/pricing; optional filters by type/category/location."""
 
     def _agency_filter(stmt):
         if city:
@@ -398,6 +430,13 @@ async def get_pricing_data(
             stmt = stmt.where(Property.country.ilike(f"%{country}%"))
         if property_type:
             stmt = stmt.where(Property.property_type.ilike(property_type))
+        if category:
+            stmt = stmt.where(
+                or_(
+                    Property.category.ilike(category),
+                    Property.property_type.ilike(category),
+                )
+            )
         return stmt
 
     q1 = _prop_filter(

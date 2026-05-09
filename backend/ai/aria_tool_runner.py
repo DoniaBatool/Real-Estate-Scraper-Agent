@@ -7,14 +7,17 @@ import json
 import logging
 from typing import Any
 
+from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.database import crud
 from backend.discovery.apify_client import discover_agencies_sync
 from backend.scraper.engine import MultiPageScraper, ScraperEngine
 from backend.ai.extractor import extract_from_multipage
 
 logger = logging.getLogger(__name__)
+_llm_client = AsyncOpenAI(api_key=settings.openai_api_key)
 
 
 def _ddg_sync(query: str) -> list[dict]:
@@ -172,19 +175,45 @@ async def execute_aria_tool(db: AsyncSession, tool_name: str, raw_args: dict[str
         query = str(args.get("query") or "").strip()
         if not query:
             return json.dumps({"error": "empty query", "results": []})
-        loop = asyncio.get_running_loop()
-        rows = await loop.run_in_executor(None, functools.partial(_ddg_sync, query))
-        out = []
-        for r in rows:
-            if isinstance(r, dict):
-                out.append(
-                    {
-                        "title": r.get("title"),
-                        "snippet": r.get("body"),
-                        "url": r.get("href"),
-                    }
-                )
-        return json.dumps({"results": out})
+        try:
+            from tavily import TavilyClient
+
+            tavily = TavilyClient(api_key=settings.tavily_api_key)
+            results = tavily.search(
+                query=query,
+                search_depth="advanced",
+                topic="general",
+                max_results=5,
+                include_answer=True,
+            )
+            return json.dumps(
+                {
+                    "answer": results.get("answer", ""),
+                    "results": [
+                        {
+                            "title": r.get("title"),
+                            "snippet": r.get("content"),
+                            "url": r.get("url"),
+                            "score": r.get("score", 0),
+                        }
+                        for r in results.get("results", [])
+                    ],
+                }
+            )
+        except Exception:
+            loop = asyncio.get_running_loop()
+            rows = await loop.run_in_executor(None, functools.partial(_ddg_sync, query))
+            out = []
+            for r in rows:
+                if isinstance(r, dict):
+                    out.append(
+                        {
+                            "title": r.get("title"),
+                            "snippet": r.get("body"),
+                            "url": r.get("href"),
+                        }
+                    )
+            return json.dumps({"results": out})
 
     if tool_name == "get_pricing_analysis":
         data = await crud.get_pricing_data(
@@ -239,5 +268,104 @@ async def execute_aria_tool(db: AsyncSession, tool_name: str, raw_args: dict[str
             },
             default=str,
         )
+
+    if tool_name == "get_area_pricing":
+        locality = str(args.get("locality") or "").strip()
+        city = str(args.get("city") or "").strip()
+        if not locality:
+            return json.dumps({"error": "locality is required"})
+        db_pricing = await crud.get_locality_pricing(db, locality)
+        market_context = ""
+        sources: list[str] = []
+        try:
+            from tavily import TavilyClient
+
+            tavily = TavilyClient(api_key=settings.tavily_api_key)
+            web_results = tavily.search(
+                query=f"average property price per sqm {locality} {city} real estate 2024 2025",
+                max_results=3,
+            )
+            market_context = web_results.get("answer", "")
+            sources = [r.get("url") for r in web_results.get("results", []) if r.get("url")]
+        except Exception:
+            pass
+        return json.dumps(
+            {
+                "locality": locality,
+                "database_data": db_pricing,
+                "avg_price_per_sqm": db_pricing.get("avg_price_per_sqm"),
+                "total_listings": db_pricing.get("count"),
+                "price_range": {
+                    "min": db_pricing.get("min_price"),
+                    "max": db_pricing.get("max_price"),
+                },
+                "market_context": market_context,
+                "sources": sources,
+            },
+            default=str,
+        )
+
+    if tool_name == "compare_properties":
+        properties = []
+        for pid in args.get("property_ids", []) or []:
+            prop = await crud.get_property_by_id(db, str(pid))
+            if prop:
+                properties.append(
+                    {
+                        "id": str(prop.id),
+                        "title": prop.title,
+                        "price": prop.price,
+                        "total_sqm": prop.total_sqm,
+                        "price_per_sqm": prop.price_per_sqm,
+                        "bedrooms": prop.bedrooms,
+                        "locality": prop.locality,
+                        "property_type": prop.property_type,
+                        "category": prop.category,
+                        "city": prop.city,
+                        "country": prop.country,
+                    }
+                )
+
+        if len(properties) < 2:
+            return json.dumps({"error": "Need at least 2 property IDs to compare"})
+
+        compare_prompt = f"""
+Compare these {len(properties)} properties and return JSON:
+{{
+  "comparison_table": [
+    {{"criteria": "Price", "values": [...per property]}},
+    {{"criteria": "Size (sqm)", "values": [...]}},
+    {{"criteria": "Price per sqm", "values": [...]}},
+    {{"criteria": "Bedrooms", "values": [...]}},
+    {{"criteria": "Location", "values": [...]}},
+    {{"criteria": "Type", "values": [...]}}
+  ],
+  "pros_cons": [
+    {{"property": "title", "pros": [...], "cons": [...]}}
+  ],
+  "recommendation": "Which one and why in 2 sentences",
+  "best_for_investment": "property title",
+  "best_for_living": "property title",
+  "best_value": "property title"
+}}
+
+Properties: {json.dumps(properties, default=str)}
+"""
+        try:
+            response = await _llm_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": compare_prompt}],
+                max_tokens=1500,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            return json.dumps(json.loads(content))
+        except Exception as exc:
+            return json.dumps(
+                {
+                    "error": str(exc),
+                    "properties": properties,
+                    "recommendation": "Unable to generate AI comparison right now.",
+                }
+            )
 
     return json.dumps({"error": f"unknown tool {tool_name}"})

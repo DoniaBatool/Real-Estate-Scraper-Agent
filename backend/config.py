@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     # Upstash Redis
     redis_url: str = ""
+    tavily_api_key: str = ""
 
     # 2captcha
     captcha_api_key: str = ""

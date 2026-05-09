@@ -7,6 +7,7 @@ import { Building2 } from "lucide-react";
 const NAV_LINKS = [
   { href: "/", label: "Home" },
   { href: "/chat", label: "Chat" },
+  { href: "/about-aria", label: "About ARIA" },
   { href: "/agencies", label: "Agencies" },
   { href: "/properties", label: "Properties" },
   { href: "/pricing", label: "Pricing" },
