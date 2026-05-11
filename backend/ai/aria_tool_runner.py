@@ -172,48 +172,63 @@ async def execute_aria_tool(db: AsyncSession, tool_name: str, raw_args: dict[str
         )
 
     if tool_name == "web_search":
-        query = str(args.get("query") or "").strip()
-        if not query:
-            return json.dumps({"error": "empty query", "results": []})
-        try:
-            from tavily import TavilyClient
+        query = args.get("query", "")
 
-            tavily = TavilyClient(api_key=settings.tavily_api_key)
-            results = tavily.search(
-                query=query,
-                search_depth="advanced",
-                topic="general",
-                max_results=5,
-                include_answer=True,
-            )
-            return json.dumps(
-                {
+        # Try Tavily first (if API key set)
+        tavily_key = getattr(settings, "tavily_api_key", "")
+
+        if tavily_key and tavily_key.startswith("tvly-"):
+            try:
+                from tavily import TavilyClient
+
+                tavily = TavilyClient(api_key=tavily_key)
+                results = tavily.search(
+                    query=query,
+                    max_results=5,
+                    include_answer=True
+                )
+                return json.dumps({
                     "answer": results.get("answer", ""),
                     "results": [
                         {
-                            "title": r.get("title"),
-                            "snippet": r.get("content"),
-                            "url": r.get("url"),
-                            "score": r.get("score", 0),
+                            "title": r.get("title", ""),
+                            "snippet": r.get("content", ""),
+                            "url": r.get("url", "")
                         }
                         for r in results.get("results", [])
                     ],
-                }
-            )
-        except Exception:
-            loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, functools.partial(_ddg_sync, query))
-            out = []
-            for r in rows:
-                if isinstance(r, dict):
-                    out.append(
-                        {
-                            "title": r.get("title"),
-                            "snippet": r.get("body"),
-                            "url": r.get("href"),
-                        }
-                    )
-            return json.dumps({"results": out})
+                    "source": "tavily"
+                })
+            except Exception as e:
+                print(f"Tavily failed: {e}")
+
+        # Fallback: DuckDuckGo
+        try:
+            from duckduckgo_search import DDGS
+
+            with DDGS() as ddgs:
+                results = list(ddgs.text(
+                    query,
+                    max_results=5,
+                    safesearch="off"
+                ))
+            return json.dumps({
+                "results": [
+                    {
+                        "title": r.get("title", ""),
+                        "snippet": r.get("body", ""),
+                        "url": r.get("href", "")
+                    }
+                    for r in results
+                ],
+                "source": "duckduckgo"
+            })
+        except Exception as e:
+            print(f"DuckDuckGo failed: {e}")
+            return json.dumps({
+                "results": [],
+                "error": str(e)
+            })
 
     if tool_name == "get_pricing_analysis":
         data = await crud.get_pricing_data(

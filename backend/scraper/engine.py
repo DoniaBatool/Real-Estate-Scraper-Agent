@@ -8,6 +8,7 @@ from backend.scraper.level1_httpx import scrape_level1
 from backend.scraper.level2_playwright import scrape_level2
 from backend.scraper.level3_proxy import scrape_level3
 from backend.scraper.listing_discovery import extract_property_urls, find_listings_page
+from backend.scraper.deep_scraper import scrape_agency_deep
 
 logger = logging.getLogger(__name__)
 
@@ -128,3 +129,11 @@ class MultiPageScraper:
             len(result["property_pages"]),
         )
         return result
+
+
+async def scrape_agency_complete_deep(agency_url: str) -> dict:
+    """
+    Deep scraper entrypoint (homepage, footer/about/contact, listings, property pages).
+    Kept in engine module for backwards-compatible imports.
+    """
+    return await scrape_agency_deep(agency_url)

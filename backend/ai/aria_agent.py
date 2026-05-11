@@ -23,49 +23,35 @@ logger = logging.getLogger(__name__)
 def detect_intent(message: str) -> str:
     msg = message.lower().strip()
 
-    appreciation_words = [
+    appreciation = [
         "thanks", "thank you", "thankyou", "shukriya",
         "good job", "great job", "well done", "amazing",
         "awesome", "excellent", "perfect", "wonderful",
-        "brilliant", "fantastic", "superb", "bohot acha",
-        "shabash", "wah", "wow", "impressive", "nice work",
+        "brilliant", "fantastic", "thats great",
+        "that's great", "great work", "nice work",
+        "shabash", "wah", "bohot acha", "bahut acha"
     ]
-    greeting_words = [
+    greetings = [
         "hi", "hello", "hey", "salam", "assalam",
-        "good morning", "good evening", "greetings",
+        "good morning", "good evening", "good afternoon",
+        "howdy", "sup", "whats up", "what's up",
+        "how are you", "how r u", "kya haal",
+        "kaisa hai", "kesy ho", "aoa"
     ]
-    emotional_words = [
-        "how are you", "how r u", "you okay", "whats up",
-        "what's up", "kya haal", "kaisa hai", "kesy ho",
-    ]
-    frustration_words = [
-        "not working", "broken", "useless", "bad",
-        "annoying", "frustrated", "angry", "wrong",
-        "error", "failed", "doesn't work",
-    ]
-    capability_words = [
-        "what can you do", "what features", "capabilities",
-        "what tools", "what skills", "help me understand",
-        "tell me about yourself", "what are you",
-    ]
-    compliment_words = [
-        "you are smart", "you're smart", "intelligent",
-        "clever", "good bot", "best agent", "love you",
-        "you're great", "you are great",
+    compliments = [
+        "you are smart", "you're smart", "so smart",
+        "intelligent", "clever", "best agent",
+        "love you", "you're great", "you are great",
+        "impressive", "good bot", "nice bot"
     ]
 
-    if any(w in msg for w in greeting_words) and len(msg) < 20:
-        return "greeting"
-    if any(w in msg for w in appreciation_words):
+    if any(w in msg for w in appreciation):
         return "appreciation"
-    if any(w in msg for w in emotional_words):
-        return "emotional"
-    if any(w in msg for w in frustration_words):
-        return "frustration"
-    if any(w in msg for w in capability_words):
-        return "capability"
-    if any(w in msg for w in compliment_words):
+    if any(w in msg for w in greetings) and len(msg) < 30:
+        return "greeting"
+    if any(w in msg for w in compliments):
         return "compliment"
+
     return "task"
 
 
@@ -121,28 +107,39 @@ async def run_aria_turn(
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     intent = detect_intent(latest_user_text)
-    memory_context = ""
-    memory_meta: dict[str, Any] = {}
-    if user_fingerprint:
-        memory_context, memory_meta = await build_personalized_context(
-            db,
-            user_fingerprint=user_fingerprint,
-            current_message=latest_user_text,
-            session_id=session_id or user_fingerprint,
-        )
-    system_prompt = AGENT_SYSTEM_PROMPT + _intent_hint(intent) + memory_context
 
-    if intent != "task":
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": latest_user_text},
-            ],
-            max_tokens=150,
-            temperature=0.9,
-        )
-        text = (response.choices[0].message.content or "").strip() or "Thank you! 😊"
+    if intent in ["appreciation", "greeting", "compliment"]:
+        import random
+
+        appreciation_responses = [
+            "Thank you! 😊 Always happy to help.",
+            "Glad I could help! Let me know if you need anything else. 🏡",
+            "That means a lot! ✨ Here whenever you need me.",
+            "Happy to be of service! What else can I help you with?",
+            "Aww, thank you! 😊 That keeps me motivated!",
+            "So glad you're happy with that! 🌟",
+        ]
+
+        greeting_responses = [
+            "Hey there! 👋 Doing great, thanks for asking. How can I help you today?",
+            "Hello! 😊 Great to connect. What property are you looking for?",
+            "Hi! Doing well, thank you! Ready to help with your real estate needs. 🏡",
+            "Hey! 👋 Always good to hear from you. What can I do for you today?",
+        ]
+
+        compliment_responses = [
+            "Thank you, that's very kind! 😊",
+            "You're too kind! 😊 Happy to help anytime.",
+            "That really means a lot, thank you! 🌟",
+        ]
+
+        if intent == "appreciation":
+            text = random.choice(appreciation_responses)
+        elif intent == "greeting":
+            text = random.choice(greeting_responses)
+        else:
+            text = random.choice(compliment_responses)
+
         if user_fingerprint:
             await store_conversation_embedding(
                 db,
@@ -158,20 +155,55 @@ async def run_aria_turn(
                 message=text,
                 role="assistant",
             )
-            if (len(orm_messages) + 1) % 3 == 0:
-                conv_text = "\n".join(
-                    [f"{getattr(m, 'role', 'user')}: {getattr(m, 'content', '')}" for m in orm_messages[-16:]]
-                    + [f"user: {latest_user_text}", f"assistant: {text}"]
-                )
-                await update_user_memory(
-                    db,
-                    user_fingerprint=user_fingerprint,
-                    conversation_text=conv_text,
-                    session_id=session_id or user_fingerprint,
-                )
-        return text, {"aria": True, "intent": intent, "aria_tool_trace": [], **memory_meta}, "conversation"
+        return text, {"aria": True, "intent": intent, "aria_tool_trace": []}, "conversation"
 
-    messages = _openai_messages_from_history(latest_user_text, orm_messages, system_prompt)
+    intent_hint = ""
+    lower_msg = latest_user_text.lower()
+    if "tell me more about" in lower_msg:
+        intent_hint = """
+[INTENT: User wants details about a specific property.
+Search database for this property title. 
+If not found, use web_search.
+Present all available details beautifully with emojis.
+DO NOT ask for city/country — search directly.]"""
+    elif any(
+        x in lower_msg
+        for x in [
+            "valletta",
+            "dubai",
+            "london",
+            "malta",
+            "malta",
+            "scrape",
+            "find agencies",
+            "show me",
+            "properties in",
+        ]
+    ):
+        intent_hint = """
+[INTENT: User gave location or task.
+Act on it IMMEDIATELY — search database first.
+If insufficient results, scrape that city.
+DO NOT repeat the sales pitch.
+DO NOT ask them to confirm — just do it.]"""
+
+    memory_context = ""
+    memory_meta: dict[str, Any] = {}
+    if user_fingerprint:
+        memory_context, memory_meta = await build_personalized_context(
+            db,
+            user_fingerprint=user_fingerprint,
+            current_message=latest_user_text,
+            session_id=session_id or user_fingerprint,
+        )
+    system_prompt = AGENT_SYSTEM_PROMPT + intent_hint + memory_context
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for h in orm_messages[-10:]:
+        role = getattr(h, "role", None)
+        content = (getattr(h, "content", None) or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": latest_user_text})
     tool_trace: list[dict[str, str]] = []
     compare_result: dict[str, Any] | None = None
     max_rounds = max(1, settings.aria_max_tool_rounds)

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.routers import scraper, agencies, properties, pricing, chat
+from backend.routers.workbench import router as workbench_router
 from backend.database.connection import init_db
 
 app = FastAPI(
@@ -28,6 +29,7 @@ app.include_router(agencies.router)
 app.include_router(properties.router)
 app.include_router(pricing.router)
 app.include_router(chat.router)
+app.include_router(workbench_router)
 
 
 @app.on_event("startup")

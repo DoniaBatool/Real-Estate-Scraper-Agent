@@ -274,7 +274,8 @@ export default function HomePage() {
   }, [goToSlide]);
 
   return (
-    <div className="relative">
+    <>
+      <div className="relative">
       {/* Horizontal slideshow: slide 1 = hero, slide 2 = platform cards */}
       <div
         ref={sliderRef}
@@ -289,7 +290,7 @@ export default function HomePage() {
           <div className="pointer-events-none absolute inset-0 z-[11] bg-[radial-gradient(ellipse_90%_60%_at_50%_35%,rgba(7,11,20,0.55),transparent)]" />
 
           <div className="relative z-20 flex min-h-0 flex-1 flex-col px-4 pb-6 pt-6 md:px-6">
-            <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center justify-center text-center">
+            <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center justify-center px-2 text-center lg:px-4">
               <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -364,30 +365,40 @@ export default function HomePage() {
         {/* ——— Slide 2: Everything You Need ——— */}
         <div
           ref={slide2Ref}
-          className="flex h-full max-h-[calc(100vh-60px)] w-full min-w-full shrink-0 snap-start snap-always flex-col items-center overflow-y-auto bg-[#070b14] px-4 py-8 md:px-8 md:py-10"
+          className="flex h-full max-h-[calc(100vh-60px)] w-full min-w-full min-h-0 shrink-0 snap-start snap-always flex-col overflow-y-auto bg-[#070b14] px-4 pb-24 pt-8 md:px-8 md:pb-28 md:pt-10"
           style={{
             backgroundImage:
-              "radial-gradient(ellipse 80% 50% at 50% -10%, rgba(37,99,235,0.14), transparent), radial-gradient(ellipse 60% 40% at 100% 50%, rgba(226,181,90,0.08), transparent)",
+              "radial-gradient(ellipse 80% 50% at 50% -10%, rgba(37,99,235,0.14), transparent), radial-gradient(ellipse 60% 40% at 100% 50%, rgba(226,181,90,0.08), transparent), radial-gradient(ellipse 70% 45% at 50% 100%, rgba(37,99,235,0.06), transparent)",
           }}
         >
-          <div className="mb-8 w-full max-w-4xl shrink-0 text-center md:mb-10">
-            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-blue-400/90">Platform</p>
-            <h2 className="text-3xl font-bold tracking-tight text-white md:text-4xl lg:text-5xl">Everything You Need</h2>
-            <p className="mx-auto mt-3 max-w-lg text-sm text-slate-400 md:text-base">
-              Three pillars — agencies, listings, and pricing intelligence. Tap a card to open.
-            </p>
+          <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col md:min-h-[min(100%,calc(100vh-60px-7rem))]">
+            <header className="shrink-0 text-center">
+              <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-blue-400/90">Platform</p>
+              <h2 className="text-3xl font-bold tracking-tight text-white md:text-4xl lg:text-5xl">Everything You Need</h2>
+              <p className="mx-auto mt-3 max-w-lg text-sm text-slate-400 md:text-base">
+                Three pillars — agencies, listings, and pricing intelligence. Tap a card to open.
+              </p>
+            </header>
+
+            {/* Fill vertical space so cards sit in the middle band instead of hugging the top */}
+            <div className="flex min-h-0 flex-1 flex-col justify-center py-8 md:py-10 lg:py-12">
+              <FeatureCards />
+            </div>
+
+            <footer className="flex shrink-0 flex-col items-center gap-3 border-t border-white/[0.06] pt-8 md:gap-4 md:pt-10">
+              <p className="text-center text-[11px] uppercase tracking-[0.18em] text-slate-600">
+                Agencies · Properties · Pricing
+              </p>
+              <button
+                type="button"
+                onClick={() => goToSlide(0)}
+                className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-5 py-2.5 text-sm font-medium text-slate-300 backdrop-blur transition hover:border-white/25 hover:bg-white/10 hover:text-white"
+              >
+                <ChevronLeft className="h-4 w-4" />
+                Back to hero
+              </button>
+            </footer>
           </div>
-
-          <FeatureCards />
-
-          <button
-            type="button"
-            onClick={() => goToSlide(0)}
-            className="mt-10 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-5 py-2.5 text-sm font-medium text-slate-300 backdrop-blur transition hover:border-white/25 hover:bg-white/10 hover:text-white"
-          >
-            <ChevronLeft className="h-4 w-4" />
-            Back to hero
-          </button>
         </div>
       </div>
 
@@ -406,5 +417,6 @@ export default function HomePage() {
         ))}
       </div>
     </div>
+    </>
   );
 }

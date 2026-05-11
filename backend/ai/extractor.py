@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from backend.config import settings
 from backend.ai.prompts import EXTRACTION_PROMPT
@@ -335,5 +336,192 @@ async def extract_from_multipage(scrape_result: dict, agency_url: str) -> dict:
         grid_html = scrape_result.get("listings_html") or home_html
         if grid_html:
             final["properties"].extend(await extract_properties_from_listings(grid_html, agency_url))
+
+    return final
+
+
+async def call_openai(prompt: str, content: str, *, max_tokens: int = 9000) -> str:
+    return await _openai_json_prompt(prompt, content, max_tokens=max_tokens)
+
+
+def parse_json_safely(text: str) -> dict:
+    parsed = parse_json_universal(text)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def extract_single_property_detail(html: str, url: str) -> dict | None:
+    """Extract complete property data from property detail page."""
+    soup = BeautifulSoup(html, "html.parser")
+    json_ld = ""
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        json_ld += (tag.string or "") + "\n"
+
+    all_images: list[str] = []
+    for img in soup.find_all("img", src=True):
+        src = str(img.get("src", ""))
+        if src:
+            full_src = urljoin(url, src)
+            lower = full_src.lower()
+            if (
+                any(ext in lower for ext in [".jpg", ".jpeg", ".png", ".webp", ".avif"])
+                and not any(x in lower for x in ["logo", "icon", "favicon", "avatar", "placeholder", "sprite", "flag"])
+            ):
+                all_images.append(full_src)
+
+    for img in soup.find_all(attrs={"data-src": True}):
+        src = str(img.get("data-src", ""))
+        if src:
+            full_src = urljoin(url, src)
+            if any(ext in full_src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                all_images.append(full_src)
+
+    all_images = list(dict.fromkeys(all_images))
+
+    property_prompt = f"""
+Extract complete property details from this real estate listing page.
+The listing URL is: {url}
+
+Return ONLY valid JSON. No markdown. No explanation.
+{{
+  "title": "property title",
+  "property_type": "villa/apartment/townhouse/commercial/land/studio/other",
+  "category": "sale/rent/both",
+  "bedrooms": null,
+  "bathrooms": null,
+  "bedroom_sqm": null,
+  "bathroom_sqm": null,
+  "total_sqm": null,
+  "plot_sqm": null,
+  "floor_number": null,
+  "total_floors": null,
+  "year_built": null,
+  "price": null,
+  "price_per_sqm": null,
+  "currency": null,
+  "locality": null,
+  "district": null,
+  "city": null,
+  "country": null,
+  "full_address": null,
+  "latitude": null,
+  "longitude": null,
+  "description": null,
+  "amenities": [],
+  "furnished": null,
+  "condition": null,
+  "energy_rating": null,
+  "listing_date": null,
+  "listing_reference": null,
+  "listing_url": "{url}",
+  "virtual_tour_url": null
+}}
+
+IMPORTANT RULES:
+- listing_url MUST be: "{url}".
+- Convert sqft to sqm: divide by 10.764.
+- price_per_sqm: compute if price and total_sqm are present.
+- Never guess; keep null if missing.
+- Images are provided separately; skip image extraction in JSON.
+
+JSON-LD Data:
+{json_ld[:3000] if json_ld else "None found"}
+"""
+
+    content = f"JSON-LD:\n{json_ld}\n\nHTML:\n{html[:15000]}"
+    response = await call_openai(property_prompt, content)
+    result = parse_json_safely(response)
+    if result and isinstance(result, dict):
+        result["listing_url"] = url
+        result["images"] = all_images[:20]
+        return result
+    return None
+
+
+async def extract_listings_page(html: str) -> list[dict]:
+    """Fallback extraction from listings page."""
+    listings_prompt = """
+Extract ALL property listings from this search results page.
+Return a JSON array of property objects.
+
+For each property extract:
+- title, property_type, category (sale/rent)
+- bedrooms, bathrooms, total_sqm, price, currency
+- locality, city, country
+- listing_url (full URL to detail page)
+- description (short)
+
+Return null for missing fields.
+"""
+    response = await call_openai(listings_prompt, html[:12000], max_tokens=7000)
+    result = parse_json_universal(response)
+    if isinstance(result, list):
+        return [p for p in result if isinstance(p, dict)]
+    if isinstance(result, dict) and isinstance(result.get("properties"), list):
+        return [p for p in result["properties"] if isinstance(p, dict)]
+    return []
+
+
+async def extract_from_deep_scrape(scrape_result: dict, agency_url: str) -> dict:
+    """Extract agency + properties from deep scrape result."""
+    final = {
+        "agency_name": None,
+        "owner_name": None,
+        "founded_year": None,
+        "email": [],
+        "phone": [],
+        "whatsapp": None,
+        "facebook_url": None,
+        "instagram_url": None,
+        "linkedin_url": None,
+        "twitter_url": None,
+        "youtube_url": None,
+        "google_rating": None,
+        "review_count": None,
+        "price_range_min": None,
+        "price_range_max": None,
+        "currency": None,
+        "specialization": None,
+        "description": None,
+        "logo_url": None,
+        "address": None,
+        "properties": [],
+    }
+
+    agency_html_parts: list[str] = []
+    if scrape_result.get("footer_html"):
+        agency_html_parts.append("=== FOOTER (contacts/social) ===\n" + scrape_result["footer_html"])
+    if scrape_result.get("about_html"):
+        agency_html_parts.append("=== ABOUT US PAGE (owner info) ===\n" + scrape_result["about_html"][:8000])
+    if scrape_result.get("contact_html"):
+        agency_html_parts.append("=== CONTACT PAGE ===\n" + scrape_result["contact_html"][:4000])
+    if scrape_result.get("homepage_html"):
+        soup = BeautifulSoup(scrape_result["homepage_html"], "html.parser")
+        header = soup.find("header") or soup.find("nav")
+        if header:
+            agency_html_parts.append("=== HEADER/NAV ===\n" + str(header))
+        agency_html_parts.append("=== HOMEPAGE (first section) ===\n" + scrape_result["homepage_html"][:3000])
+
+    combined_agency_html = "\n\n".join(agency_html_parts)
+    agency_prompt = """
+Extract agency information from this HTML content.
+Multiple sections are included: footer, about page, contact page, homepage header.
+
+Look for owner_name, founded_year, email, phone, whatsapp, social URLs, address,
+description, logo_url, specialization, google_rating, review_count, price range, currency.
+Return valid JSON only. Use null for missing fields, [] for missing email/phone arrays.
+"""
+    agency_data = await call_openai(agency_prompt, combined_agency_html[:18000], max_tokens=5000)
+    parsed_agency = parse_json_safely(agency_data)
+    for key, value in parsed_agency.items():
+        if key != "properties" and value is not None:
+            final[key] = value
+
+    for prop_page in scrape_result.get("property_pages", []):
+        prop_data = await extract_single_property_detail(prop_page.get("html", ""), prop_page.get("url", ""))
+        if prop_data and prop_data.get("title"):
+            final["properties"].append(prop_data)
+
+    if not final["properties"] and scrape_result.get("listings_html"):
+        final["properties"].extend(await extract_listings_page(scrape_result["listings_html"]))
 
     return final

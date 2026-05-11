@@ -1,9 +1,11 @@
 "use client";
 
+import axios from "axios";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { chatWithAgent } from "@/lib/api";
+import { stripEmojisForSpeech } from "@/lib/stripEmojisForSpeech";
 
 type VoiceState = "idle" | "listening" | "processing" | "speaking";
 
@@ -27,24 +29,53 @@ function getVoiceSessionId(): string {
   return sid;
 }
 
+function formatVoiceApiError(e: unknown): string {
+  if (axios.isAxiosError(e)) {
+    if (e.code === "ECONNABORTED") return "Request timed out. Try again or check your connection.";
+    const data = e.response?.data as { detail?: unknown } | undefined;
+    if (typeof data?.detail === "string") return data.detail;
+    if (Array.isArray(data?.detail)) return JSON.stringify(data.detail);
+    if (e.response?.status === 502)
+      return "Could not reach the API server. Start FastAPI (e.g. uvicorn on port 8000) and reload.";
+    if (e.response?.status) return `Chat request failed (${e.response.status}).`;
+  }
+  if (e instanceof Error) return e.message;
+  return "Something went wrong. Try again or use text chat.";
+}
+
 export function VoiceOrb() {
   const [state, setState] = useState<VoiceState>("idle");
   const [transcript, setTranscript] = useState("");
   const [response, setResponse] = useState("");
+  const [voiceError, setVoiceError] = useState("");
   const [isOpen, setIsOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const transcriptRef = useRef("");
+  const voiceDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceSubmittedRef = useRef(false);
 
   /** Fixed heights for the speaking waveform (avoids impure random during render). */
   const waveHeights = [14, 22, 18, 26, 12, 24, 16, 20, 10, 28, 18, 22];
+
+  const clearVoiceDebounce = useCallback(() => {
+    if (voiceDebounceRef.current) {
+      clearTimeout(voiceDebounceRef.current);
+      voiceDebounceRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
+  useEffect(() => {
+    return () => clearVoiceDebounce();
+  }, [clearVoiceDebounce]);
+
   const processVoiceInput = useCallback(async (text: string) => {
+    setVoiceError("");
     setState("processing");
 
     try {
@@ -52,7 +83,13 @@ export function VoiceOrb() {
       const fingerprint = getVoiceFingerprint();
 
       const result = await chatWithAgent(text, sessionId, [], fingerprint);
-      setResponse(result.reply);
+      const reply = (result.reply ?? "").trim();
+      if (!reply) {
+        setVoiceError("ARIA returned an empty reply. Try again or open Chat.");
+        setState("idle");
+        return;
+      }
+      setResponse(reply);
 
       setState("speaking");
       window.speechSynthesis.cancel();
@@ -74,26 +111,38 @@ export function VoiceOrb() {
         }, 1500);
       });
 
-      const utterance = new SpeechSynthesisUtterance(result.reply);
-      const voices = window.speechSynthesis.getVoices();
-      const preferred = voices.find(
-        (v) =>
-          v.name.includes("Samantha") ||
-          v.name.includes("Google UK English Female") ||
-          v.name.includes("Microsoft Aria") ||
-          v.lang === "en-GB",
-      );
-      if (preferred) utterance.voice = preferred;
+      const speechText = stripEmojisForSpeech(reply);
+      if (speechText.trim()) {
+        const utterance = new SpeechSynthesisUtterance(speechText);
+        const voices = window.speechSynthesis.getVoices();
+        const preferred = voices.find(
+          (v) =>
+            v.name.includes("Samantha") ||
+            v.name.includes("Google UK English Female") ||
+            v.name.includes("Microsoft Aria") ||
+            v.lang === "en-GB",
+        );
+        if (preferred) utterance.voice = preferred;
 
-      utterance.rate = 0.95;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
+        utterance.rate = 0.95;
+        utterance.pitch = 1.0;
+        utterance.volume = 1.0;
 
-      utterance.onend = () => setState("idle");
-      utterance.onerror = () => setState("idle");
+        utterance.onend = () => setState("idle");
+        utterance.onerror = () => setState("idle");
 
-      window.speechSynthesis.speak(utterance);
-    } catch {
+        // Chrome often leaves synthesis paused; after await the user gesture is gone — resume unlocks audio.
+        try {
+          window.speechSynthesis.resume();
+        } catch {
+          /* ignore */
+        }
+        window.speechSynthesis.speak(utterance);
+      } else {
+        setState("idle");
+      }
+    } catch (e: unknown) {
+      setVoiceError(formatVoiceApiError(e));
       setState("idle");
     }
   }, []);
@@ -106,9 +155,12 @@ export function VoiceOrb() {
       return;
     }
 
+    clearVoiceDebounce();
+    voiceSubmittedRef.current = false;
     setState("listening");
     setTranscript("");
     setResponse("");
+    setVoiceError("");
     transcriptRef.current = "";
 
     const recognition = new SpeechRecognitionCtor();
@@ -123,18 +175,44 @@ export function VoiceOrb() {
         .join("");
       transcriptRef.current = current;
       setTranscript(current);
+      clearVoiceDebounce();
+      voiceDebounceRef.current = setTimeout(() => {
+        voiceDebounceRef.current = null;
+        const t = transcriptRef.current.trim();
+        if (t && recognitionRef.current) {
+          voiceSubmittedRef.current = true;
+          recognitionRef.current.stop();
+          void processVoiceInput(t);
+        }
+      }, 1100);
     };
 
     recognition.onend = () => {
-      const text = transcriptRef.current.trim();
-      if (text) {
-        void processVoiceInput(text);
-      } else {
-        setState("idle");
+      clearVoiceDebounce();
+      if (!voiceSubmittedRef.current) {
+        const text = transcriptRef.current.trim();
+        if (text) void processVoiceInput(text);
+        else setState("idle");
       }
+      voiceSubmittedRef.current = false;
     };
 
-    recognition.onerror = () => {
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      clearVoiceDebounce();
+      const code = event.error;
+      if (code === "aborted") {
+        setState("idle");
+        return;
+      }
+      if (code === "not-allowed") {
+        setVoiceError("Microphone access denied. Allow the mic for this site in the browser address bar.");
+      } else if (code === "no-speech") {
+        setVoiceError("No speech detected. Speak after the orb turns red, or check your microphone.");
+      } else if (code === "network") {
+        setVoiceError("Speech recognition needs a working network (browser uses a cloud service).");
+      } else {
+        setVoiceError(`Voice recognition stopped (${code}). Try again.`);
+      }
       setState("idle");
     };
 
@@ -142,11 +220,14 @@ export function VoiceOrb() {
   };
 
   const stopAll = () => {
+    clearVoiceDebounce();
+    voiceSubmittedRef.current = false;
     recognitionRef.current?.stop();
     window.speechSynthesis.cancel();
     setState("idle");
     setTranscript("");
     setResponse("");
+    setVoiceError("");
     transcriptRef.current = "";
   };
 
@@ -228,7 +309,7 @@ export function VoiceOrb() {
         typeof document !== "undefined" &&
         createPortal(
           <AnimatePresence>
-            {isOpen && (transcript || response) && (
+            {isOpen && (
               <>
                 <motion.div
                   initial={{ opacity: 0 }}
@@ -271,9 +352,33 @@ export function VoiceOrb() {
                 <p id="voice-orb-panel-title" className="text-sm font-medium text-white">
                   ARIA
                 </p>
-                <p className="text-xs text-green-400">● Voice Active</p>
+                <p className="text-xs text-green-400">
+                  {state === "listening" && "● Listening"}
+                  {state === "processing" && "● Thinking"}
+                  {state === "speaking" && "● Speaking"}
+                  {state === "idle" && voiceError && "● Error"}
+                  {state === "idle" && !voiceError && (transcript || response) && "● Done"}
+                  {state === "idle" && !voiceError && !transcript && !response && "● Voice"}
+                </p>
               </div>
             </div>
+
+            {state === "listening" && !transcript.trim() && (
+              <p className="mb-4 text-sm leading-relaxed text-slate-400">
+                Speak now. Your message is sent about a second after you pause — or when the browser finishes
+                capturing audio.
+              </p>
+            )}
+
+            {state === "processing" && (
+              <p className="mb-4 text-sm text-amber-200/90">ARIA is thinking…</p>
+            )}
+
+            {voiceError && (
+              <div className="mb-4 rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                {voiceError}
+              </div>
+            )}
 
             {transcript && (
               <div className="mb-3">

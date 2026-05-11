@@ -11,6 +11,8 @@ const NAV_LINKS = [
   { href: "/agencies", label: "Agencies" },
   { href: "/properties", label: "Properties" },
   { href: "/pricing", label: "Pricing" },
+  { href: "/workbench", label: "🔬 Workbench" },
+  { href: "/workbench/extract", label: "⚡ Extractor" },
 ];
 
 export default function NavBar() {
@@ -79,7 +81,10 @@ export default function NavBar() {
         {/* Nav links */}
         <div style={{ display: "flex", gap: "0.25rem", marginLeft: "auto" }}>
           {NAV_LINKS.map((link) => {
-            const active = pathname === link.href;
+            const active =
+              link.href === "/workbench"
+                ? pathname.startsWith("/workbench")
+                : pathname === link.href;
             return (
               <Link
                 key={link.href}

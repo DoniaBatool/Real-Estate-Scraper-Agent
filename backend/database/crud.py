@@ -1,7 +1,7 @@
 """CRUD operations for agencies and properties."""
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import delete, func, or_, select, text
 from backend.database.models import (
     Agency,
     Property,
@@ -35,6 +35,29 @@ async def get_agencies(
 async def get_agency_by_id(db: AsyncSession, agency_id: str) -> Agency | None:
     result = await db.execute(select(Agency).where(Agency.id == agency_id))
     return result.scalar_one_or_none()
+
+
+async def get_agencies_with_missing_listing_urls(
+    db: AsyncSession, *, min_missing: int = 5, limit: int = 20
+) -> list[tuple[Agency, int]]:
+    """Return agencies with many properties missing listing_url."""
+    missing_count = func.count(Property.id).label("missing_count")
+    stmt = (
+        select(Agency, missing_count)
+        .join(Property, Property.agency_id == Agency.id)
+        .where(
+            or_(
+                Property.listing_url.is_(None),
+                func.length(func.trim(Property.listing_url)) == 0,
+            )
+        )
+        .group_by(Agency.id)
+        .having(missing_count >= min_missing)
+        .order_by(missing_count.desc())
+        .limit(limit)
+    )
+    rows = await db.execute(stmt)
+    return [(agency, int(count)) for agency, count in rows.all()]
 
 
 async def create_agency(db: AsyncSession, data: dict) -> Agency:
@@ -144,6 +167,13 @@ async def create_property(db: AsyncSession, data: dict) -> Property:
     await db.commit()
     await db.refresh(prop)
     return prop
+
+
+async def delete_properties_for_agency(db: AsyncSession, agency_id) -> int:
+    """Delete all properties for one agency. Returns deleted row count."""
+    result = await db.execute(delete(Property).where(Property.agency_id == agency_id))
+    await db.commit()
+    return int(result.rowcount or 0)
 
 
 async def get_property_by_id(db: AsyncSession, property_id: str) -> Property | None:

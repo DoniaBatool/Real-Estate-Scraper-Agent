@@ -6,6 +6,11 @@ logger = logging.getLogger(__name__)
 # Apify's official Google Places / Maps actor
 APIFY_ACTOR = "compass/crawler-google-places"
 
+# Cap client wait so the HTTP request always returns (see actor.call(wait_secs=...)).
+APIFY_WAIT_SECS = 660
+# Fewer places = faster runs; raise if you need exhaustive coverage.
+APIFY_MAX_PLACES_PER_SEARCH = 50
+
 
 def discover_agencies_sync(city: str, country: str) -> list[dict]:
     """
@@ -22,26 +27,38 @@ def discover_agencies_sync(city: str, country: str) -> list[dict]:
 
     client = ApifyClient(cfg.apify_api_token)
     search_query = f"real estate agency {city} {country}"
-    logger.info("Apify discovery: %s (actor: %s)", search_query, APIFY_ACTOR)
+    logger.info(
+        "Apify discovery: %s (actor: %s, wait_secs=%s)",
+        search_query,
+        APIFY_ACTOR,
+        APIFY_WAIT_SECS,
+    )
 
     run = client.actor(APIFY_ACTOR).call(
         run_input={
             "searchStringsArray": [search_query],
-            "maxCrawledPlacesPerSearch": 50,
+            "maxCrawledPlacesPerSearch": APIFY_MAX_PLACES_PER_SEARCH,
             "language": "en",
             "maxReviews": 0,
             "exportPlaceUrls": False,
-        }
+        },
+        wait_secs=APIFY_WAIT_SECS,
     )
 
-    dataset_id = (run or {}).get("defaultDatasetId")
+    dataset_id = (run or {}).get("defaultDatasetId") if run else None
     if not dataset_id:
         logger.warning("Apify returned no dataset ID")
         return []
 
     agencies: list[dict] = []
     for item in client.dataset(dataset_id).iterate_items():
-        website = (item.get("website") or "").strip()
+        website = (
+            item.get("website")
+            or item.get("websiteUrl")
+            or item.get("url")
+            or ""
+        )
+        website = str(website).strip()
         if not website:
             continue
         if not website.startswith("http"):

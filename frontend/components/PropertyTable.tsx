@@ -9,6 +9,7 @@ import {
   createColumnHelper,
 } from "@tanstack/react-table";
 import type { Property } from "@/types";
+import { propertyImageSrc, resolvePropertyImages } from "@/lib/listingImages";
 import {
   Bath,
   Bed,
@@ -23,7 +24,6 @@ import {
 } from "lucide-react";
 
 const col = createColumnHelper<Property>();
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 function fmtNum(n?: number | null, dec = 0) {
   if (n == null || !Number.isFinite(Number(n))) return "—";
@@ -322,10 +322,11 @@ function sortRows(rows: Property[], mode: SortMode): Property[] {
   return copy;
 }
 
-function PropertyThumb({ images }: { images?: string[] }) {
+function PropertyThumb({ images, listingUrl }: { images?: string[]; listingUrl?: string | null }) {
   const [imgError, setImgError] = useState(false);
   const [hover, setHover] = useState(false);
-  const first = images?.[0];
+  const resolved = useMemo(() => resolvePropertyImages(images, listingUrl), [images, listingUrl]);
+  const first = resolved[0];
   const showImg = Boolean(first && !imgError);
 
   return (
@@ -359,8 +360,8 @@ function PropertyThumb({ images }: { images?: string[] }) {
           </div>
         )}
       </div>
-      {images && images.length > 1 && (
-        <span className="mt-1 block text-center text-xs text-gray-400">📷 {images.length}</span>
+      {resolved.length > 1 && (
+        <span className="mt-1 block text-center text-xs text-gray-400">📷 {resolved.length}</span>
       )}
       {hover && showImg && (
         <div
@@ -387,86 +388,6 @@ function PropertyThumb({ images }: { images?: string[] }) {
   );
 }
 
-function GalleryModal({
-  open,
-  title,
-  images,
-  onClose,
-}: {
-  open: boolean;
-  title: string;
-  images: string[];
-  onClose: () => void;
-}) {
-  if (!open) return null;
-  return (
-    <div
-      role="dialog"
-      aria-modal
-      aria-label="Image gallery"
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 100,
-        background: "rgba(10,15,26,0.88)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "1.5rem",
-      }}
-      onClick={onClose}
-      onKeyDown={(e) => e.key === "Escape" && onClose()}
-    >
-      <div
-        style={{
-          maxWidth: 900,
-          width: "100%",
-          maxHeight: "90vh",
-          overflow: "auto",
-          borderRadius: 12,
-          border: "1px solid var(--border)",
-          background: "var(--bg-card)",
-          padding: "1rem",
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-          <div style={{ fontWeight: 700, color: "var(--text-primary)", fontSize: "0.9rem" }}>{title}</div>
-          <button
-            type="button"
-            onClick={onClose}
-            style={{
-              borderRadius: 8,
-              border: "1px solid var(--border)",
-              background: "rgba(255,255,255,0.06)",
-              color: "var(--text-secondary)",
-              padding: "0.35rem 0.65rem",
-              cursor: "pointer",
-              fontSize: "0.75rem",
-            }}
-          >
-            Close
-          </button>
-        </div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
-            gap: "0.5rem",
-          }}
-        >
-          {images.map((src, i) => (
-            <div key={`${src}-${i}`} style={{ borderRadius: 8, overflow: "hidden", border: "1px solid var(--border)", aspectRatio: "4/3", background: "#1a2744" }}>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function categoryStyle(cat?: string | null): { bg: string; color: string } {
   const c = (cat || "").toLowerCase();
   if (c.includes("rent")) return { bg: "rgba(59,130,246,0.2)", color: "#93c5fd" };
@@ -482,7 +403,9 @@ export default function PropertyTable({
   agencyNames?: Record<string, string>;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [gallery, setGallery] = useState<{ title: string; images: string[] } | null>(null);
+  const [galleryImages, setGalleryImages] = useState<string[]>([]);
+  const [galleryTitle, setGalleryTitle] = useState("");
+  const [galleryOpen, setGalleryOpen] = useState(false);
 
   const [globalFilter, setGlobalFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
@@ -570,7 +493,9 @@ export default function PropertyTable({
       col.display({
         id: "thumb",
         header: "",
-        cell: ({ row }) => <PropertyThumb images={row.original.images} />,
+        cell: ({ row }) => (
+          <PropertyThumb images={row.original.images} listingUrl={row.original.listing_url} />
+        ),
       }),
       col.accessor("title", {
         id: "listing",
@@ -849,45 +774,27 @@ export default function PropertyTable({
                   href={p.listing_url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: 6,
-                    padding: "0.4rem 0.65rem",
-                    borderRadius: 8,
-                    border: "1px solid rgba(59,130,246,0.55)",
-                    background: "rgba(37,99,235,0.12)",
-                    color: "#93c5fd",
-                    fontSize: "0.72rem",
-                    fontWeight: 600,
-                    textDecoration: "none",
-                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/20 px-3 py-1.5 text-xs text-gray-300 transition-all hover:border-blue-400/60 hover:bg-blue-500/10 hover:text-white"
                 >
-                  <ExternalLink size={14} />
+                  <ExternalLink size={12} />
                   View Listing
                 </a>
               ) : (
-                <span
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: 6,
-                    padding: "0.4rem 0.65rem",
-                    borderRadius: 8,
-                    border: "1px solid rgba(148,163,184,0.25)",
-                    background: "rgba(255,255,255,0.03)",
-                    color: "var(--text-muted)",
-                    fontSize: "0.72rem",
-                    fontWeight: 600,
-                    opacity: 0.65,
-                    cursor: "not-allowed",
-                  }}
-                >
-                  <ExternalLink size={14} />
-                  View Listing
-                </span>
+                <div className="group relative w-full">
+                  <button
+                    type="button"
+                    disabled
+                    className="flex w-full cursor-not-allowed items-center justify-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-gray-600"
+                  >
+                    <ExternalLink size={12} />
+                    No URL
+                  </button>
+                  <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 w-48 -translate-x-1/2 rounded-lg border border-white/10 bg-gray-900 p-2 text-center text-xs text-white opacity-0 transition-opacity group-hover:opacity-100">
+                    URL not available. Re-scrape this agency to get direct listing links.
+                    <div className="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
+                  </div>
+                </div>
               )}
               <Link
                 href={hrefChat}
@@ -909,45 +816,52 @@ export default function PropertyTable({
                 <MessageCircle size={14} />
                 Ask ARIA
               </Link>
-              <a
-                href={`${API_BASE}/api/properties/${p.id}/report`}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  generateReport(p);
+                }}
                 style={{
-                  display: "inline-flex",
+                  display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  gap: 6,
-                  padding: "0.4rem 0.65rem",
+                  gap: "0.375rem",
+                  width: "100%",
+                  padding: "0.375rem 0.75rem",
                   borderRadius: 8,
-                  border: "1px solid rgba(148,163,184,0.25)",
-                  background: "rgba(255,255,255,0.04)",
-                  color: "var(--text-secondary)",
-                  fontSize: "0.72rem",
-                  textDecoration: "none",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  color: "rgb(209,213,219)",
+                  fontSize: "0.75rem",
+                  cursor: "pointer",
                 }}
               >
                 📄 Report
-              </a>
-              {p.images && p.images.length > 1 && (
+              </button>
+              {p.images && p.images.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => setGallery({ title: p.title || "Listing", images: p.images || [] })}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setGalleryImages(resolvePropertyImages(p.images, p.listing_url));
+                    setGalleryTitle(p.title || "Property Photos");
+                    setGalleryOpen(true);
+                  }}
                   style={{
-                    display: "inline-flex",
+                    display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    gap: 6,
-                    padding: "0.4rem 0.65rem",
+                    gap: "0.375rem",
+                    width: "100%",
+                    padding: "0.375rem 0.75rem",
                     borderRadius: 8,
-                    border: "1px solid var(--border)",
-                    background: "rgba(255,255,255,0.04)",
-                    color: "var(--text-secondary)",
-                    fontSize: "0.72rem",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    color: "rgb(209,213,219)",
+                    fontSize: "0.75rem",
                     cursor: "pointer",
                   }}
                 >
-                  Photos ({p.images.length})
+                  📷 Photos ({p.images.length})
                 </button>
               )}
             </div>
@@ -1093,15 +1007,169 @@ export default function PropertyTable({
     }
   }
 
+  const generateReport = (property: Property) => {
+    const agencyName = agencyNames?.[property.agency_id as string] || "Unknown Agency";
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Property Report — ${property.title || "Property"}</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body {
+            font-family: Arial, sans-serif;
+            color: #1a1a2e;
+            padding: 40px;
+            line-height: 1.6;
+          }
+          .header {
+            background: #0a1628;
+            color: white;
+            padding: 30px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+          }
+          .header h1 { font-size: 24px; margin-bottom: 4px; }
+          .header p { color: #7eb8f7; font-size: 14px; }
+          .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            background: #dbeafe;
+            color: #1d4ed8;
+            margin-right: 6px;
+            margin-bottom: 12px;
+          }
+          .badge.sale { background: #dcfce7; color: #166534; }
+          .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 24px;
+          }
+          .card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 16px;
+          }
+          .card-label {
+            font-size: 11px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+          }
+          .card-value {
+            font-size: 20px;
+            font-weight: bold;
+            color: #0a1628;
+          }
+          .price {
+            font-size: 36px;
+            font-weight: bold;
+            color: #2563eb;
+            margin-bottom: 4px;
+          }
+          .price-sqm { font-size: 16px; color: #64748b; }
+          h2 {
+            font-size: 18px;
+            color: #1B4F8A;
+            border-bottom: 2px solid #2563eb;
+            padding-bottom: 8px;
+            margin-bottom: 16px;
+            margin-top: 24px;
+          }
+          .amenity {
+            display: inline-block;
+            padding: 4px 10px;
+            background: #f1f5f9;
+            border-radius: 4px;
+            font-size: 13px;
+            margin: 3px;
+          }
+          .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #e2e8f0;
+            text-align: center;
+            color: #94a3b8;
+            font-size: 12px;
+          }
+          table { width: 100%; border-collapse: collapse; }
+          th {
+            background: #1B4F8A;
+            color: white;
+            padding: 10px;
+            text-align: left;
+            font-size: 13px;
+          }
+          td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 13px;
+          }
+          tr:nth-child(even) td { background: #f8fafc; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>🏡 Property Intelligence Report</h1>
+          <p>Generated by ARIA — RE Intelligence Platform</p>
+          <p style="margin-top:8px;color:#94a3b8;font-size:12px">
+            ${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}
+          </p>
+        </div>
+        <span class="badge">${(property.property_type || "property").toUpperCase()}</span>
+        ${property.category ? `<span class="badge sale">${property.category.toUpperCase()}</span>` : ""}
+        <h1 style="font-size:28px;margin-bottom:8px">${property.title || "Untitled Property"}</h1>
+        <div class="price">${property.currency || "EUR"} ${property.price ? property.price.toLocaleString() : "Price on Request"}</div>
+        ${property.price_per_sqm ? `<p class="price-sqm">${property.currency || "EUR"} ${property.price_per_sqm.toLocaleString()} per m²</p>` : ""}
+        ${property.description ? `<p style="color:#475569;margin:16px 0">${property.description}</p>` : ""}
+
+        <h2>Property Details</h2>
+        <div class="grid">
+          <div class="card"><div class="card-label">Bedrooms</div><div class="card-value">${property.bedrooms ?? "—"}${property.bedroom_sqm ? ` <span style="font-size:14px;color:#64748b">(${property.bedroom_sqm} m²)</span>` : ""}</div></div>
+          <div class="card"><div class="card-label">Bathrooms</div><div class="card-value">${property.bathroom_count ?? "—"}${property.bathroom_sqm ? ` <span style="font-size:14px;color:#64748b">(${property.bathroom_sqm} m²)</span>` : ""}</div></div>
+          <div class="card"><div class="card-label">Total Size</div><div class="card-value">${property.total_sqm ? `${property.total_sqm} m²` : "—"}</div></div>
+          <div class="card"><div class="card-label">Plot Size</div><div class="card-value">${property.plot_sqm ? `${property.plot_sqm} m²` : "—"}</div></div>
+          <div class="card"><div class="card-label">Floor</div><div class="card-value">${property.floor_number ?? "—"}${property.total_floors ? ` of ${property.total_floors}` : ""}</div></div>
+          <div class="card"><div class="card-label">Year Built</div><div class="card-value">${property.year_built ?? "—"}</div></div>
+        </div>
+
+        <h2>Location</h2>
+        <table>
+          <tr><th>Locality</th><th>District</th><th>City</th><th>Country</th></tr>
+          <tr><td>${property.locality || "—"}</td><td>${property.district || "—"}</td><td>${property.city || "—"}</td><td>${property.country || "—"}</td></tr>
+        </table>
+        ${property.full_address ? `<p style="margin-top:8px;color:#475569;font-size:13px">📍 ${property.full_address}</p>` : ""}
+        ${property.amenities?.length ? `<h2>Amenities</h2><div>${property.amenities.map((a) => `<span class="amenity">${a}</span>`).join("")}</div>` : ""}
+
+        <h2>Listed By</h2>
+        <table>
+          <tr><th>Agency</th><th>Listed Date</th><th>Reference</th></tr>
+          <tr><td>${agencyName}</td><td>${property.listing_date || "—"}</td><td>${property.listing_reference || property.reference || "—"}</td></tr>
+        </table>
+        ${property.listing_url ? `<p style="margin-top:16px"><strong>Original Listing:</strong> <a href="${property.listing_url}" style="color:#2563eb">${property.listing_url}</a></p>` : ""}
+        <div class="footer"><p>Generated by ARIA — RE Intelligence Platform</p><p style="margin-top:4px">Data sourced directly from agency websites</p></div>
+      </body>
+      </html>
+    `;
+
+    const printWindow = window.open("", "_blank");
+    if (printWindow) {
+      printWindow.document.write(html);
+      printWindow.document.close();
+      printWindow.onload = () => {
+        setTimeout(() => printWindow.print(), 500);
+      };
+    }
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "1.25rem" }}>
-      <GalleryModal
-        open={gallery != null}
-        title={gallery?.title ?? ""}
-        images={gallery?.images ?? []}
-        onClose={() => setGallery(null)}
-      />
-
       {data.length > 0 && (
         <div
           style={{
@@ -1409,7 +1477,11 @@ export default function PropertyTable({
                           >
                             <RowDetailPanel
                               property={p}
-                              onGallery={() => setGallery({ title: p.title || "Listing", images: p.images || [] })}
+                              onGallery={() => {
+                                setGalleryImages(resolvePropertyImages(p.images, p.listing_url));
+                                setGalleryTitle(p.title || "Property Photos");
+                                setGalleryOpen(true);
+                              }}
                               onShare={() => shareListing(p.listing_url)}
                             />
                           </div>
@@ -1427,6 +1499,81 @@ export default function PropertyTable({
       <p style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>
         Showing <strong style={{ color: "var(--text-secondary)" }}>{filtered.length}</strong> of {data.length} listings
       </p>
+
+      {galleryOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex flex-col bg-black/90"
+          onClick={() => setGalleryOpen(false)}
+        >
+          <div
+            className="flex items-center justify-between border-b border-white/10 p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div>
+              <h3 className="font-semibold text-white">{galleryTitle}</h3>
+              <p className="text-sm text-gray-400">{galleryImages.length} photos</p>
+            </div>
+            <button
+              onClick={() => setGalleryOpen(false)}
+              className="flex h-10 w-10 items-center justify-center text-3xl leading-none text-gray-400 hover:text-white"
+            >
+              ✕
+            </button>
+          </div>
+          <div
+            className="flex-1 overflow-y-auto p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {galleryImages.length === 0 ? (
+              <div className="flex h-64 flex-col items-center justify-center text-gray-500">
+                <span className="mb-4 text-6xl">📷</span>
+                <p>No photos available for this property</p>
+                <p className="mt-2 text-sm">Photos will appear after re-scraping this agency</p>
+              </div>
+            ) : (
+              <div className="mx-auto grid max-w-5xl grid-cols-2 gap-3 md:grid-cols-3">
+                {galleryImages.map((src, idx) => (
+                  <div
+                    key={`${src}-${idx}`}
+                    className="group relative aspect-video overflow-hidden rounded-lg bg-[#1a2744]"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={src}
+                      alt={`Photo ${idx + 1}`}
+                      className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                      onError={(e) => {
+                        e.currentTarget.parentElement!.innerHTML = `
+                          <div class="w-full h-full flex items-center justify-center text-gray-600 flex-col gap-2">
+                            <span class="text-3xl">🏠</span>
+                            <span class="text-xs">Image unavailable</span>
+                          </div>`;
+                      }}
+                    />
+                    <a
+                      href={src}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <span className="rounded-full bg-black/60 px-3 py-1 text-sm text-white">
+                        Open full size ↗
+                      </span>
+                    </a>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div
+            className="border-t border-white/10 p-4 text-center text-sm text-gray-500"
+            onClick={(e) => e.stopPropagation()}
+          >
+            Click outside to close · Click image to open full size
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1451,30 +1598,33 @@ function RowDetailPanel({
     <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
       {p.images && p.images.length > 0 && (
         <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6 }}>
-          {p.images.map((src, i) => (
-            <button
-              key={`${src}-${i}`}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onGallery();
-              }}
-              style={{
-                flex: "0 0 auto",
-                border: "none",
-                padding: 0,
-                borderRadius: 10,
-                overflow: "hidden",
-                cursor: "pointer",
-                width: 160,
-                height: 110,
-                background: "#1a2744",
-              }}
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            </button>
-          ))}
+          {p.images.map((src, i) => {
+            const abs = propertyImageSrc(src, p.listing_url);
+            return (
+              <button
+                key={`${src}-${i}`}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onGallery();
+                }}
+                style={{
+                  flex: "0 0 auto",
+                  border: "none",
+                  padding: 0,
+                  borderRadius: 10,
+                  overflow: "hidden",
+                  cursor: "pointer",
+                  width: 160,
+                  height: 110,
+                  background: "#1a2744",
+                }}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={abs} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              </button>
+            );
+          })}
         </div>
       )}
       {p.description && (

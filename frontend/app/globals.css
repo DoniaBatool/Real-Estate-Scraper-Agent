@@ -121,6 +121,25 @@ body {
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
 }
 
+/* Text inputs on dark pages — solid theme bg; overrides UA / autofill washing out to white */
+.theme-text-input {
+  color-scheme: dark;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+}
+.theme-text-input::placeholder {
+  color: var(--text-muted);
+}
+.theme-text-input:-webkit-autofill,
+.theme-text-input:-webkit-autofill:hover,
+.theme-text-input:-webkit-autofill:focus,
+.theme-text-input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 1000px var(--bg-base) inset !important;
+  box-shadow: 0 0 0 1000px var(--bg-base) inset !important;
+  -webkit-text-fill-color: var(--text-primary) !important;
+  caret-color: var(--text-primary);
+}
+
 /* Themed selects (Properties filters dropdowns) */
 .theme-select {
   color-scheme: dark;

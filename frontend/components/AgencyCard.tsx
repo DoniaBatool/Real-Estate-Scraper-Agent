@@ -54,9 +54,13 @@ const interactivePointer = { pointerEvents: "auto" as const };
 export default function AgencyCard({
   agency,
   onRequestDelete,
+  onRequestRepair,
+  repairing,
 }: {
   agency: Agency;
   onRequestDelete?: (agency: Agency) => void;
+  onRequestRepair?: (agency: Agency) => void;
+  repairing?: boolean;
 }) {
   const currency = agency.currency ?? "EUR";
   const targetHref = `/properties?agency_id=${encodeURIComponent(agency.id)}`;
@@ -421,24 +425,55 @@ export default function AgencyCard({
             <ExternalLink size={9} style={{ flexShrink: 0 }} />
           </a>
 
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              padding: "0.375rem 0.75rem",
-              borderRadius: 6,
-              fontSize: "0.75rem",
-              fontWeight: 600,
-              color: "#fff",
-              background: "var(--accent-blue)",
-              whiteSpace: "nowrap",
-              transition: "all 0.15s",
-              boxShadow: "0 0 10px rgba(37,99,235,0.25)",
-            }}
-          >
-            View Properties
-          </span>
+          <div style={{ ...interactivePointer, display: "flex", alignItems: "center", gap: 8 }}>
+            {onRequestRepair && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onRequestRepair(agency);
+                }}
+                disabled={repairing}
+                title="Re-scrape only this agency and refresh listing URLs"
+                style={{
+                  ...interactivePointer,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  padding: "0.35rem 0.55rem",
+                  borderRadius: 6,
+                  fontSize: "0.7rem",
+                  fontWeight: 600,
+                  border: "1px solid rgba(251,191,36,0.35)",
+                  color: "#fde68a",
+                  background: "rgba(251,191,36,0.12)",
+                  cursor: repairing ? "wait" : "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {repairing ? "Repairing…" : "Repair"}
+              </button>
+            )}
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                padding: "0.375rem 0.75rem",
+                borderRadius: 6,
+                fontSize: "0.75rem",
+                fontWeight: 600,
+                color: "#fff",
+                background: "var(--accent-blue)",
+                whiteSpace: "nowrap",
+                transition: "all 0.15s",
+                boxShadow: "0 0 10px rgba(37,99,235,0.25)",
+              }}
+            >
+              View Properties
+            </span>
+          </div>
         </div>
       </div>
     </div>

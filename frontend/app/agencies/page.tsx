@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type CSSProperties } from "react";
 import { motion } from "framer-motion";
-import { deleteAgency, getAgencies } from "@/lib/api";
+import { deleteAgency, getAgencies, repairAgency } from "@/lib/api";
 import type { Agency, AgencyFilters } from "@/types";
 import AgencyCard from "@/components/AgencyCard";
 import { Loader2, Building2 } from "lucide-react";
@@ -16,6 +16,8 @@ export default function AgenciesPage() {
   const [deleteTarget, setDeleteTarget] = useState<Agency | null>(null);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [repairingAgencyId, setRepairingAgencyId] = useState<string | null>(null);
+  const [repairMessage, setRepairMessage] = useState("");
 
   useEffect(() => {
     const load = async () => {
@@ -76,6 +78,23 @@ export default function AgenciesPage() {
       setError("Failed to delete all agencies");
     } finally {
       setDeleting(false);
+    }
+  };
+
+  const handleRepairAgency = async (agency: Agency) => {
+    if (repairingAgencyId) return;
+    setRepairingAgencyId(agency.id);
+    setError("");
+    setRepairMessage("");
+    try {
+      const job = await repairAgency(agency.id);
+      setRepairMessage(
+        `Repair started for ${agency.name}. Job ID: ${job.job_id}. You can monitor it from backend status endpoint.`,
+      );
+    } catch {
+      setError(`Failed to start repair for ${agency.name}`);
+    } finally {
+      setRepairingAgencyId(null);
     }
   };
 
@@ -162,6 +181,21 @@ export default function AgenciesPage() {
             {error}
           </div>
         )}
+        {!!repairMessage && (
+          <div
+            style={{
+              marginBottom: "1rem",
+              border: "1px solid rgba(16,185,129,0.35)",
+              background: "rgba(16,185,129,0.12)",
+              color: "#86efac",
+              borderRadius: 10,
+              padding: "0.75rem 0.9rem",
+              fontSize: "0.8rem",
+            }}
+          >
+            {repairMessage}
+          </div>
+        )}
 
         {!loading && !error && agencies.length === 0 && (
           <div style={{ padding: "5rem 0", textAlign: "center" }}>
@@ -181,7 +215,12 @@ export default function AgenciesPage() {
               transition={{ delay: i * 0.04 }}
               style={{ position: "relative" }}
             >
-              <AgencyCard agency={a} onRequestDelete={setDeleteTarget} />
+              <AgencyCard
+                agency={a}
+                onRequestDelete={setDeleteTarget}
+                onRequestRepair={handleRepairAgency}
+                repairing={repairingAgencyId === a.id}
+              />
             </motion.div>
           ))}
         </div>
