@@ -12,7 +12,23 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-_REF_QUERY_KEYS = frozenset({"ref", "reference", "listing_id", "id", "property_id", "listingid", "code"})
+_REF_QUERY_KEYS = frozenset(
+    {
+        "ref",
+        "refs",
+        "reference",
+        "listing_id",
+        "listingid",
+        "id",
+        "property_id",
+        "propertyid",
+        "refno",
+        "reference_no",
+        "referenceno",
+        "code",
+        "listing_ref",
+    }
+)
 _PHONE_RE = re.compile(
     r"(?:\+?\d{1,4}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,6}",
     re.I,
@@ -28,7 +44,8 @@ _BATH_RE = re.compile(
 )
 _SQM_RE = re.compile(r"(?:m²|m2|sqm|sq\.?\s*m)\s*[:.]?\s*(\d{2,5})\b", re.I)
 _REF_INLINE_RE = re.compile(
-    r"(?:reference|ref\.?|listing\s*#|property\s*#)\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/]{2,40})",
+    r"(?:\bReference\b|\bRef\b|listing\s*#|property\s*#)\s*[:#]?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9\-_/]{2,40})\b",
     re.I,
 )
 
@@ -42,6 +59,14 @@ def _url_has_reference_param(url: str) -> bool:
         path = (urlparse(url).path or "").lower()
         # Single listing paths only — not /properties/ index listings grid
         if "/property/" in path or "/listing/" in path:
+            return True
+        if re.search(r"/rooms/\d{6,30}(?:/|$)", path, re.I):
+            return True
+        if re.search(
+            r"/(?:listings?|properties?)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)",
+            path,
+            re.I,
+        ):
             return True
         if re.search(r"/[a-z]{1,4}\d[\w\-]*", path, re.I):
             return True

@@ -1,0 +1,20 @@
+{
+  "skill_name": "stagehand-scraping",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Write a Next.js API route at /api/stagehand/scrape-listings that takes a URL and extracts e-commerce product listings (name, price, image, link) using Stagehand v3. Make sure it handles the case where Browserbase is not available and falls back to running locally.",
+      "expected_output": "A complete route.ts file using env: LOCAL, stagehand.context.pages()[0], agent() with structured Zod output schema (with .describe() on each field), TypeScript cast for agentResult.output, fallback to extract(), proper error handling with stagehand.close() in finally, maxDuration:120, runtime:nodejs"
+    },
+    {
+      "id": 2,
+      "prompt": "I'm building a job board scraper with Stagehand. I need to: (1) go to a job listings page, (2) extract all visible jobs with title/company/salary/link, and (3) then click into each job to get the full description. What's the best approach and can you write the code?",
+      "expected_output": "Explains agent() for navigation and extract() for detail pages (two-step pattern). Code uses correct v3 APIs, rich Zod schema with .describe(), TypeScript cast, relative URL fix, waitForTimeout not waitForLoadState"
+    },
+    {
+      "id": 3,
+      "prompt": "My Stagehand scraper is returning empty results and sometimes crashes with 'activePage is not a function'. Here's my code:\n\nconst page = stagehand.context.activePage();\nawait page.goto(url, { timeout: 30000 });\nconst data = await stagehand.extract('get all products', ProductSchema);\n\nHow do I fix this?",
+      "expected_output": "Identifies 3 bugs: (1) activePage() → pages()[0], (2) timeout → timeoutMs, (3) extract() alone on a page that may need navigation → should use agent() first. Provides corrected code."
+    }
+  ]
+}

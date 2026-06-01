@@ -1,81 +1,78 @@
--- Run this SQL in your Supabase SQL Editor (supabase.com → SQL Editor)
+-- ============================================================
+-- ARIA Real Estate Agent — Supabase Schema v2
+-- Only chat history is stored. Property data is always live.
+-- Run this in your Supabase SQL Editor.
+-- ============================================================
 
--- Table 1: Real estate agencies
-CREATE TABLE IF NOT EXISTS agencies (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at      TIMESTAMPTZ DEFAULT NOW(),
-  scraped_at      TIMESTAMPTZ DEFAULT NOW(),
-  name            TEXT NOT NULL,
-  owner_name      TEXT,
-  founded_year    INT,
-  description     TEXT,
-  logo_url        TEXT,
-  website_url     TEXT UNIQUE NOT NULL,
-  email           TEXT[],
-  phone           TEXT[],
-  whatsapp        TEXT,
-  facebook_url    TEXT,
-  instagram_url   TEXT,
-  linkedin_url    TEXT,
-  twitter_url     TEXT,
-  google_rating   FLOAT,
-  review_count    INT,
-  specialization  TEXT,
-  price_range_min FLOAT,
-  price_range_max FLOAT,
-  currency        TEXT DEFAULT 'EUR',
-  total_listings  INT,
-  city            TEXT,
-  country         TEXT,
-  scrape_level    INT,
-  scrape_status   TEXT DEFAULT 'pending'
+-- Drop old tables if migrating from v1
+DROP TABLE IF EXISTS chat_tool_runs   CASCADE;
+DROP TABLE IF EXISTS chat_summaries   CASCADE;
+DROP TABLE IF EXISTS chat_messages    CASCADE;
+DROP TABLE IF EXISTS chat_threads     CASCADE;
+DROP TABLE IF EXISTS properties       CASCADE;
+DROP TABLE IF EXISTS agencies         CASCADE;
+DROP TABLE IF EXISTS conversation_embeddings CASCADE;
+DROP TABLE IF EXISTS user_memory      CASCADE;
+
+-- ── Chat Threads ──────────────────────────────────────────────────────────
+CREATE TABLE chat_threads (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title      TEXT NOT NULL DEFAULT 'New Chat',
+    archived   BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Table 2: Individual property listings
-CREATE TABLE IF NOT EXISTS properties (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  agency_id       UUID REFERENCES agencies(id) ON DELETE CASCADE,
-  created_at      TIMESTAMPTZ DEFAULT NOW(),
-  title           TEXT,
-  property_type   TEXT,
-  category        TEXT,
-  description     TEXT,
-  images          TEXT[],
-  bedrooms        INT,
-  bathroom_count  INT,
-  bedroom_sqm     FLOAT,
-  bathroom_sqm    FLOAT,
-  total_sqm       FLOAT,
-  plot_sqm        FLOAT,
-  furnished       TEXT,
-  floor_number    INT,
-  total_floors    INT,
-  year_built      INT,
-  condition       TEXT,
-  energy_rating   TEXT,
-  virtual_tour_url TEXT,
-  listing_reference TEXT,
-  full_address    TEXT,
-  price           FLOAT,
-  price_per_sqm   FLOAT,
-  currency        TEXT DEFAULT 'EUR',
-  locality        TEXT,
-  district        TEXT,
-  city            TEXT,
-  country         TEXT,
-  latitude        FLOAT,
-  longitude       FLOAT,
-  listing_date    DATE,
-  amenities       TEXT[],
-  listing_url     TEXT
+CREATE INDEX idx_chat_threads_updated  ON chat_threads (updated_at DESC);
+CREATE INDEX idx_chat_threads_archived ON chat_threads (archived);
+
+-- ── Chat Messages ─────────────────────────────────────────────────────────
+CREATE TABLE chat_messages (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    thread_id  UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content    TEXT NOT NULL,
+    meta_json  TEXT,          -- JSON: tool traces, scraped properties, etc.
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Indexes for fast filtering
-CREATE INDEX IF NOT EXISTS idx_properties_agency   ON properties(agency_id);
-CREATE INDEX IF NOT EXISTS idx_properties_locality ON properties(locality);
-CREATE INDEX IF NOT EXISTS idx_properties_type     ON properties(property_type);
-CREATE INDEX IF NOT EXISTS idx_properties_price    ON properties(price);
-CREATE INDEX IF NOT EXISTS idx_agencies_city       ON agencies(city, country);
+CREATE INDEX idx_chat_messages_thread ON chat_messages (thread_id, created_at ASC);
 
--- Categories / departments inferred from site navigation + listings (run once if DB existed before this column)
-ALTER TABLE agencies ADD COLUMN IF NOT EXISTS property_categories TEXT[];
+-- ── Chat Summaries (for long thread compression) ──────────────────────────
+CREATE TABLE chat_summaries (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    thread_id     UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    summary       TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_chat_summaries_thread ON chat_summaries (thread_id, created_at DESC);
+
+-- ── Chat Tool Runs (for observability / debugging) ────────────────────────
+CREATE TABLE chat_tool_runs (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    thread_id      UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    message_id     UUID REFERENCES chat_messages(id) ON DELETE SET NULL,
+    tool_name      TEXT NOT NULL,
+    tool_args_json TEXT,
+    rationale      TEXT,
+    status         TEXT NOT NULL DEFAULT 'started',
+    output_json    TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_chat_tool_runs_thread ON chat_tool_runs (thread_id, created_at DESC);
+
+-- ── Auto-update updated_at on chat_threads ────────────────────────────────
+CREATE OR REPLACE FUNCTION update_chat_thread_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE chat_threads SET updated_at = now() WHERE id = NEW.thread_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_chat_messages_update_thread
+    AFTER INSERT ON chat_messages
+    FOR EACH ROW EXECUTE FUNCTION update_chat_thread_timestamp();

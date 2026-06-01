@@ -28,56 +28,19 @@ Browser → Next.js often calls **`/api/...`** on the same origin; `frontend/app
 | **`OPENAI_MODEL` in `backend/.env`** | User-defined (example: `gpt-4o-mini`) | Read as `settings.openai_model` in `backend/config.py` (default **`gpt-4o-mini`** if unset). |
 | **Extractor: `POST /api/workbench/extract-single`** (`extract_property_detail_universal`) | **`settings.openai_model`** (e.g. `gpt-4o-mini`) | On rate/context errors it may **retry** with a **smaller HTML slice** and **`gpt-4o-mini`**. |
 | **Workbench bulk extract: `POST /api/workbench/extract`** (comprehensive prompt in `workbench.py`) | **`gpt-4o`** (hardcoded in router) | Uses `smart_scrape` HTML + JSON-LD + meta + first chunk of HTML. |
-| **HOQ list & detail** (`/api/workbench/hoq/scrape-list`, `.../scrape-detail`) | **`settings.openai_model`** via `call_openai` in `backend/ai/extractor.py` | Playwright HTML → LLM JSON (list rows / detail object), then HTML supplements (sqm, description, etc.). |
 | **ARIA / other tools** | Often `gpt-4o-mini` in code paths | Separate from Workbench/Extractor tables. |
 
-**Important:** Changing `.env` **`OPENAI_MODEL`** affects HOQ list/detail, universal extract-single, and other `call_openai` callers; **`/api/workbench/extract` still uses `gpt-4o`** until that line is changed in code.
+**Important:** Changing `.env` **`OPENAI_MODEL`** affects universal extract-single and other callers; **`/api/workbench/extract` still uses `gpt-4o`** until that line is changed in code.
 
 ---
 
-# Page 1: **Workbench** (`/workbench`)
+## `/workbench` → **Property Extractor**
 
-### Purpose
-
-Focused **Homes of Quality (HOQ)**-style workflow: load listing grid from a **fixed listing index URL**, optionally load more pages, **select rows**, run **per-property detail scrape**, merge listing + detail, export / save.
-
-*(There is also a Malta agencies block and optional title that includes selected agencies.)*
-
-### Main approach (data flow)
-
-1. **Listings** — Frontend calls **`POST /api/workbench/hoq/scrape-list`** with:
-   - base listing URL (default HOQ latest properties),
-   - page index and how many pages to fetch in one request.
-   - Backend loads the page with **Playwright**, trims HTML for the model, then **`call_openai`** with **`settings.openai_model`** returns a **JSON list** of properties; rows are normalized and deduped. Pagination hints come from DOM parsing of the same HTML.
-
-2. **Detail for selected** — For each selected **reference**, frontend calls **`POST /api/workbench/hoq/scrape-detail`** (batched per ref). Backend again uses **Playwright** + **LLM JSON** (`HOQ_DETAIL_PROMPT`), then **fills/corrects** fields from raw HTML (description, sqm, images, room dimensions).
-
-3. **Merge** — UI merges **listing row + detail row** so the table shows one combined view.
-
-4. **Save / export** — Uses existing workbench save / XLSX export helpers on the merged rows.
-
-### Buttons & controls (what they do)
-
-| UI element | Behaviour |
-|------------|-----------|
-| **Real estate agencies (Malta)** | City/locality → **`POST /api/workbench/discover`** (Apify) → table of agencies with websites. Checkboxes update the **property listings section title** to include selected agency names. |
-| **No. of pages** | How many HOQ listing **index pages** to pull in one “load” call. |
-| **🔄 Load listings** | Calls `hoqScrapeList` from page 1 (or as implemented) with `pagesToFetch`; fills the **listings table**. |
-| **Load all pages** | Loads up to the detected total listing pages (confirmation if large). |
-| **✅ Select all / Clear selection** | Selects or clears rows in the **filtered** listing table. |
-| **🔍 Get detail for selected (N)** | For each selected reference, calls **`hoqScrape-detail`**; fills **detail extraction** section / merged rows. |
-| **Sort & filters** | Client-side filter/sort on loaded rows. |
-| **Export (CSV / Excel / JSON)** | Exports current merged or listing data (see buttons on that page). |
-| **Save to database** | Posts merged payload to **`POST /api/workbench/save`** (agency/city/country metadata). |
-
-### When to use Workbench
-
-- You want the **built-in HOQ listing + detail pipeline** and exports tied to that flow.
-- You do **not** need arbitrary agency site URL crawling (that’s more Extractor).
+The route **`/workbench`** redirects to **`/workbench/extract`**. There is no separate single-site listing pipeline in this repo — use the extractor (crawl + universal extract) for any agency domain. **Malta agency discovery (Apify)** lives on the extractor page as a convenience panel.
 
 ---
 
-# Page 2: **Property Extractor** (`/workbench/extract`)
+# **Property Extractor** (`/workbench/extract`)
 
 ### Purpose
 
@@ -90,6 +53,16 @@ Focused **Homes of Quality (HOQ)**-style workflow: load listing grid from a **fi
    - Backend runs **breadth-first Playwright crawl** on the same registrable domain (after redirects, domain may be corrected).  
    - Collects internal `<a href>` links, buckets them (`property_pages`, `listing_pages`, etc.), returns **`all_urls`** + groups.  
    - Frontend stores **`allCrawlUrls`** for later “find pages mentioning reference”.
+   - While visiting each page, the API collects references via **`backend/scraper/reference_sniffer.py`**: (1) **regex** on raw HTML for `Reference:`, `Ref:`, etc.; (2) **DOM/CSS** hooks where label and value sit in different nodes — e.g. `<span class="reference-number">90-9269064</span>`, `h6.ref-num`, `[data-reference]`, `<small>Ref: FA701973</small>`. Tokens are deduped into **`references_from_html`**. Every internal URL whose path/query **contains that token** is recorded in **`urls_by_reference`**. The Extractor UI **merges** those URLs into Step 2 with **`reference` prefilled** when the token is known — so even when the grid link has **no ref in the URL**, you still get candidate detail URLs once the same ref appears in **some** link on the site.
+   - Within each bucket, URLs are **sorted** so links that already carry a **reference in the query or path** (e.g. `?ref=`, `?reference=`, `/property/…`) appear **first** — those are usually the real single-property detail URLs on multi-agency sites. Generic listing grids without ref in the URL rank lower.
+
+### Reference numbers (extractor)
+
+| Topic | **Extractor (`/workbench/extract`)** |
+|-------|----------------------------------------|
+| **Sites** | **Any** agency domain you crawl |
+| **Where `reference` comes from** | OpenAI JSON (`reference_number`) **plus** deterministic fallbacks in `universal_extractor.py` — URL query keys (`ref`, `reference`, …), path tokens (e.g. `/listings/<uuid>`), HTML feature tables (**REF** / Reference / Listing ID / Property ID), `reference_sniffer.py` regex + DOM hooks, then merge in UI `normalizeProperty` |
+| **Why some rows show empty Ref** | Listing-only URLs often **have no ref in the URL**; ref may live only in card HTML. If the model/parser misses it, the cell stays empty until **Deep extract** or a URL that contains the ref is found |
 
 2. **Optional — Scan & keep only property-like pages (`POST /api/workbench/qualify-property-urls`)**  
    - Quick **ScraperEngine** pass per URL + heuristics (reference, contact, bed/bath/schema).  
@@ -117,7 +90,7 @@ Focused **Homes of Quality (HOQ)**-style workflow: load listing grid from a **fi
 
 ### Extractor table columns
 
-Columns are defined in `frontend/app/workbench/extract/page.tsx` (`COLUMNS` + `normalizeProperty`). Newer fields include **sitting room, hallway, laundry, garage, garage capacity, yard, roof, terrace** when the listing HTML exposes them (e.g. Perry “Property Features” table).
+Columns are defined in `frontend/lib/workbenchPropertyModel.ts` (`COLUMNS` + `normalizeProperty`). Newer fields include **sitting room, hallway, laundry, garage, garage capacity, yard, roof, terrace** when the listing HTML exposes them (e.g. Perry “Property Features” table).
 
 ---
 
@@ -151,8 +124,6 @@ Ensure **`OPENAI_API_KEY`** (and **`APIFY_API_TOKEN`** for Malta agency discover
 | `POST /api/workbench/match-reference-urls` | Deep extract reference → URLs |
 | `POST /api/workbench/extract-single` | Universal single-page extract |
 | `POST /api/workbench/extract` | Workbench-style comprehensive extract (gpt-4o) |
-| `POST /api/workbench/hoq/scrape-list` | Workbench listings |
-| `POST /api/workbench/hoq/scrape-detail` | Workbench detail |
 | `POST /api/workbench/discover` | Malta agencies (Apify) |
 | `POST /api/workbench/save` | Persist merged properties |
 
@@ -160,7 +131,6 @@ Ensure **`OPENAI_API_KEY`** (and **`APIFY_API_TOKEN`** for Malta agency discover
 
 ## Design philosophy (short)
 
-- **Workbench** = opinionated **HOQ** pipeline (fast path for one known site pattern).  
 - **Extractor** = **generic** agency pipeline (crawl → filter → extract → deep merge).  
 - **Reliability** = combine **Playwright-rendered HTML**, **deterministic parsers** for stable tables, and **LLM** for messy text — with merges that avoid “LLM wrong but non-empty” blocking corrections.
 

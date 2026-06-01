@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -15,8 +16,19 @@ from openai import AsyncOpenAI
 from backend.ai.extractor import parse_json_safely
 from backend.config import settings
 from backend.scraper.engine import ScraperEngine
-from backend.scraper.html_signals import discover_listing_urls, url_fingerprint
+from backend.scraper.html_signals import (
+    discover_listing_urls,
+    reference_slug_looks_like_catalog_hub,
+    should_skip_href_for_property_extract,
+    url_fingerprint,
+)
 from backend.scraper.level2_playwright import scrape_level2
+from backend.scraper.email_normalize import sanitize_email_field
+from backend.scraper.phone_normalize import normalize_phone_display
+from backend.scraper.reference_sniffer import (
+    collect_reference_tokens_from_html,
+    token_plausible_property_reference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +53,13 @@ INSTRUCTIONS:
 4. Return as flat JSON object (no nested objects except arrays)
 5. Field names: lowercase with underscores
 
+PROPERTY DETAIL PAGES (critical):
+- Every filled field must describe THIS listing only (the same URL as Page URL). Do not mix data from related listings, search results sidebars, ads, or site footers.
+- reference_number, internal_sqm, external_sqm, total_sqm, floor_level, main_image (first hero/gallery photo), and all_images must match the main property block / feature table for this listing, not generic site images.
+
 For real estate PROPERTY DETAIL pages also fill when visible:
-- reference_number, title, price (number), price_text, currency
+- reference_number (same value whether the page labels it "Reference", "REF", "Ref.", "Listing ID", "Property code", "Property ID", or it appears only in the URL as ?ref= / ?reference=, or as a UUID in the path e.g. /listings/bd199e03-16e1-4dad-ac3e-658adced81ad)
+- title, price (number), price_text, currency
 - property_type, category (sale/rent), status, badge
 - bedrooms, bathrooms, internal_sqm, external_sqm, total_sqm
 - locality, town, region, country, full_address
@@ -51,9 +68,17 @@ For real estate PROPERTY DETAIL pages also fill when visible:
 - balconies (text or number), kitchens (int), living_rooms (int), dining_rooms (int)
 - dining_room_dims, living_room_dims, kitchen_dims (text or semicolon-separated if multiple)
 - bedroom_dims (object keyed by bedroom label OR string listing each bedroom size)
-- agent_name, agent_phone, agent_email, agency_name
-- description, features (array), amenities (array), all_images (array of absolute URLs)
+- agent_name, agent_phone, agent_email, agency_name (estate agency / listing agent only)
+- owner_name, owner_phone, owner_email (property owner, vendor, landlord, or seller — NOT the agency agent)
+- price_per_night (number or short text e.g. "€120/night" for holiday lets)
+- price_per_month (number or short text e.g. "€1,800/month" for long lets)
+- has_wifi (bool) when WiFi / internet / WLAN is clearly stated for this listing
+- description, features (array), amenities (array), main_image (single absolute URL: primary listing photo), all_images (array of absolute URLs)
 - listing_url (same as page URL)
+
+AGENT vs OWNER:
+- If the page shows both an agent and an owner/vendor, map agency staff to agent_* and the owner/vendor to owner_*.
+- If only one contact block exists, use the visible label ("Agent", "Listed by", "Owner", "Vendor"); if ambiguous, fill agent_* and leave owner_* null.
 
 RULES:
 - Use null for missing fields
@@ -230,6 +255,9 @@ def _collect_property_candidates_from_html(
             extra.add(full)
 
     for u in list(dict.fromkeys(raw_urls)) + list(extra):
+        pu = urlparse(u)
+        if should_skip_href_for_property_extract(pu.path or "", pu.query or ""):
+            continue
         fp = url_fingerprint(u, fp_base)
         if fp in seen_fp:
             continue
@@ -249,11 +277,20 @@ def _collect_property_candidates_from_html(
 
 
 async def _fetch_listing_page_html(url: str) -> tuple[str | None, str | None]:
-    """Prefer Playwright for JS-rendered grids; fall back to ScraperEngine."""
+    """Prefer Playwright for JS-rendered grids; fast HTTP when the page is mostly static HTML."""
+    try:
+        from backend.scraper.level1_httpx import scrape_level1
+
+        r1 = await scrape_level1(url)
+        h = (r1.get("html") or "").strip()
+        if h and len(h) > 3500:
+            return h, None
+    except Exception:
+        pass
     try:
         r2 = await scrape_level2(url)
         html = (r2.get("html") or "").strip()
-        if html and len(html) > 800:
+        if html and len(html) > 500:
             return html, None
     except Exception as exc:
         logger.debug("scrape_level2 listing failed %s: %s", url, exc)
@@ -271,8 +308,22 @@ async def _fetch_listing_page_html(url: str) -> tuple[str | None, str | None]:
 def _extract_reference_from_url(url: str) -> str | None:
     try:
         q = parse_qsl(urlparse(url).query, keep_blank_values=True)
+        ref_keys = (
+            "reference",
+            "ref",
+            "refs",
+            "listing_id",
+            "listingid",
+            "property_id",
+            "propertyid",
+            "refno",
+            "reference_no",
+            "referenceno",
+            "code",
+            "listing_ref",
+        )
         for k, v in q:
-            if k.lower() in ("reference", "ref", "listing_id", "id", "property_id"):
+            if k.lower() in ref_keys:
                 s = unquote(v).strip()
                 if s:
                     return s
@@ -280,9 +331,39 @@ def _extract_reference_from_url(url: str) -> str | None:
         m = re.search(r"(?:reference|ref)[_=]([A-Za-z0-9\-]+)", url, re.I)
         if m:
             return m.group(1).strip()
+        # Airbnb (and similar): /rooms/<numeric listing id> — no letters in segment.
+        m_rooms = re.search(r"/rooms/(\d{6,30})(?:/|\?|$)", path + "/", re.I)
+        if m_rooms:
+            return m_rooms.group(1).strip()
+        # Letify / many platforms: /listings/<uuid> or /listing/<uuid>
+        m_uuid = re.search(
+            r"/(?:listings?|properties?)/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/|\?|$)",
+            path + "/",
+            re.I,
+        )
+        if m_uuid:
+            return m_uuid.group(1).strip()
+        low = path.lower()
+        if any(
+            x in low
+            for x in (
+                "/property/",
+                "/properties/",
+                "/listing/",
+                "/listings/",
+                "/rent/",
+                "/sale/",
+                "/detail",
+            )
+        ):
+            m_hex = re.search(r"/([0-9a-f]{8})(?:/|$|\?|#)", path, re.I)
+            if m_hex:
+                return m_hex.group(1).strip()
         m2 = re.search(r"/([A-Za-z]{1,4}\d[\w\-]*)", path)
         if m2:
-            return m2.group(1).strip()
+            tok = m2.group(1).strip()
+            if not reference_slug_looks_like_catalog_hub(tok):
+                return tok
     except Exception:
         pass
     return None
@@ -330,6 +411,190 @@ def _extract_feature_table_pairs(soup: BeautifulSoup) -> dict[str, str]:
     return out
 
 
+# Normalised first-column labels that mean "property reference" in feature tables.
+_REF_PAIR_LABELS = frozenset(
+    {
+        "ref",
+        "reference",
+        "reference number",
+        "reference no",
+        "reference no.",
+        "listing ref",
+        "listing ref.",
+        "listing reference",
+        "property ref",
+        "property reference",
+        "listing id",
+        "listing id.",
+        "property id",
+        "property code",
+        "listing code",
+        "sku",
+        "unit ref",
+        "unit reference",
+    }
+)
+
+
+def _reference_from_feature_pairs(pairs: dict[str, str]) -> str | None:
+    """Map table header variants (REF / Ref. / Reference number) to one reference string."""
+    for label, val in pairs.items():
+        if not val or not str(val).strip():
+            continue
+        lab = label.strip().lower().replace(".", "").strip(":").strip()
+        if lab in _REF_PAIR_LABELS:
+            cand = str(val).strip()
+            if token_plausible_property_reference(cand):
+                return cand
+    return None
+
+
+_ROOM_DIM_VALUE_HINT = re.compile(
+    r"(?:\d+\s*[x×*]\s*\d+|\d+(?:\.\d+)?\s*m\s*[²2]|m\s*[²2]|\d+\s*m\b)",
+    re.I,
+)
+
+
+def _value_looks_like_room_dimensions(val: str) -> bool:
+    s = val.strip()
+    if len(s) < 2 or not re.search(r"\d", s):
+        return False
+    return bool(_ROOM_DIM_VALUE_HINT.search(s))
+
+
+def _extract_room_dimension_maps_from_pairs(
+    pairs: dict[str, str],
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    """Pull bedroom/bathroom size rows from generic feature tables (e.g. Bedroom 1 → 4.2m x 3.1m)."""
+    beds: dict[str, str] = {}
+    baths: dict[str, str] = {}
+    for raw_k, raw_v in pairs.items():
+        k = raw_k.strip().lower()
+        v = str(raw_v).strip()
+        if not v:
+            continue
+        mb = re.match(r"^bedroom\s*(?:no\.?\s*)?(\d+)\s*$", k)
+        if mb and _value_looks_like_room_dimensions(v):
+            beds[f"Bedroom {mb.group(1)}"] = v
+            continue
+        mb2 = re.match(r"^bedroom\s*(?:no\.?\s*)?(\d+)\s*(?:dimensions?|sizes?|area)\s*$", k)
+        if mb2:
+            beds[f"Bedroom {mb2.group(1)}"] = v
+            continue
+        mt = re.match(r"^bathroom\s*(?:no\.?\s*)?(\d+)\s*$", k)
+        if mt and _value_looks_like_room_dimensions(v):
+            baths[f"Bathroom {mt.group(1)}"] = v
+            continue
+        mt2 = re.match(r"^bathroom\s*(?:no\.?\s*)?(\d+)\s*(?:dimensions?|sizes?|area)\s*$", k)
+        if mt2:
+            baths[f"Bathroom {mt2.group(1)}"] = v
+            continue
+    return (beds if beds else None, baths if baths else None)
+
+
+def _pair_float_first(pairs: dict[str, str], *keys: str) -> float | None:
+    """First non-empty table cell among known header variants (keys are lowercased like pairs)."""
+    for k in keys:
+        kk = k.lower()
+        if kk not in pairs:
+            continue
+        v = _to_float_if_possible(pairs[kk])
+        if v is not None and v > 0:
+            return v
+    return None
+
+
+def _pair_float_matching(
+    pairs: dict[str, str], *, must: str, must_not: tuple[str, ...], any_of: tuple[str, ...]
+) -> float | None:
+    for pk, pv in pairs.items():
+        pl = pk.lower().replace("²", "2").replace("³", "3")
+        if must not in pl:
+            continue
+        if any(b in pl for b in must_not):
+            continue
+        if any_of and not any(a in pl for a in any_of):
+            continue
+        v = _to_float_if_possible(pv)
+        if v is not None and v > 0:
+            return v
+    return None
+
+
+def _agent_from_contact_sidebar(soup: BeautifulSoup) -> dict[str, str | None]:
+    """
+    Perry-style sidebar: 'Contact Agent' then person name on its own line, optional job title below.
+    """
+    out: dict[str, str | None] = {"agent_name": None, "agent_phone": None, "agent_email": None}
+    skip_titles = {
+        "franchise owner",
+        "senior consultant",
+        "sales associate",
+        "branch manager",
+        "property consultant",
+        "real estate agent",
+        "letting agent",
+        "listing agent",
+        "contact agent",
+    }
+    mail_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    for node in soup.find_all(string=re.compile(r"contact\s+(the\s+)?listing\s+agent|contact\s+agent\b", re.I)):
+        card = node.parent
+        for _ in range(10):
+            if not card:
+                break
+            if card.name in ("aside", "section") or (
+                card.name == "div"
+                and len(card.get_text(" ", strip=True)) > 30
+                and len(card.get_text(" ", strip=True)) < 4000
+            ):
+                break
+            card = card.parent
+        if not card:
+            card = node.parent
+        for a in card.select("a[href^='mailto:']"):
+            em = sanitize_email_field(a.get("href", ""))
+            if em:
+                out["agent_email"] = em
+                break
+        for a in card.select("a[href^='tel:']"):
+            ph = normalize_phone_display(a.get("href", "").replace("tel:", "").split("?")[0])
+            if ph:
+                out["agent_phone"] = ph
+                break
+        lines = [ln.strip() for ln in card.get_text("\n").splitlines() if ln.strip()]
+        for ln in lines:
+            m = mail_re.search(ln)
+            if m and not out["agent_email"]:
+                out["agent_email"] = m.group(0).strip()
+            phm = re.search(r"(\+?\d[\d\s().-]{8,})", ln)
+            if phm and not out["agent_phone"]:
+                out["agent_phone"] = normalize_phone_display(phm.group(1).strip())
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if "contact" in low and "agent" in low:
+                continue
+            if "following options" in low:
+                continue
+            if "@" in ln or "mailto" in low:
+                continue
+            if re.search(r"\d{4,}", ln) and "(" in ln:
+                continue
+            if not re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}$", ln) or len(ln) > 70:
+                continue
+            if low in skip_titles:
+                continue
+            if i + 1 < len(lines) and lines[i + 1].strip().lower() in skip_titles:
+                out["agent_name"] = ln
+                break
+            if i > 0 and "contact" in lines[i - 1].lower():
+                out["agent_name"] = ln
+                break
+        if out["agent_name"]:
+            break
+    return out
+
+
 def _extract_contact_agent_block(soup: BeautifulSoup) -> dict[str, str | None]:
     name = None
     phone = None
@@ -355,12 +620,18 @@ def _extract_contact_agent_block(soup: BeautifulSoup) -> dict[str, str | None]:
     if not email:
         a = soup.select_one("a[href^='mailto:']")
         if a and a.get("href"):
-            email = a.get("href", "").replace("mailto:", "").strip() or None
+            email = sanitize_email_field(a.get("href", "").strip())
     if not phone:
         a = soup.select_one("a[href^='tel:']")
         if a and a.get("href"):
-            phone = a.get("href", "").replace("tel:", "").strip() or None
-    return {"agent_name": name, "agent_phone": phone, "agent_email": email}
+            phone = a.get("href", "").replace("tel:", "").split("?")[0].strip() or None
+    phone = normalize_phone_display(phone)
+    out = {"agent_name": name, "agent_phone": phone, "agent_email": email}
+    side = _agent_from_contact_sidebar(soup)
+    for k in ("agent_name", "agent_phone", "agent_email"):
+        if not out.get(k) and side.get(k):
+            out[k] = side[k]
+    return out
 
 
 def _deterministic_property_extract(html: str, url: str) -> dict:
@@ -388,11 +659,57 @@ def _deterministic_property_extract(html: str, url: str) -> dict:
         m_head_loc = re.match(r"([A-Za-z][A-Za-z\s'\-]{2,32})\b", h1_txt or "")
         if m_head_loc:
             out["locality"] = m_head_loc.group(1).strip()
-    out["reference_number"] = (
-        pairs.get("reference number")
-        or pairs.get("reference")
-        or _extract_reference_from_url(url)
+    ref_inline: str | None = None
+    m_ir = re.search(
+        r"(?:\bReference\b|\bRef\b|listing\s*#|property\s*#)\s*[:#]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9\-_/]{2,40})\b",
+        text,
+        re.I,
     )
+    if m_ir:
+        cand_ir = m_ir.group(1).strip()
+        if token_plausible_property_reference(cand_ir):
+            ref_inline = cand_ir
+    if ref_inline is None:
+        m_pipe = re.search(r"\bRef\s*\|\s*([A-Za-z0-9][A-Za-z0-9\-]{2,20})\b", text, re.I)
+        if m_pipe:
+            cand_p = m_pipe.group(1).strip()
+            if token_plausible_property_reference(cand_p):
+                ref_inline = cand_p
+    content_scope = (
+        soup.select_one(
+            "main, article, [role='main'], .property-detail, .single-property, "
+            "#property, .listing-detail, .property--content, .property-content, .inner-content"
+        )
+        or soup.body
+    )
+    scope_html = str(content_scope) if content_scope else html
+    dom_refs = collect_reference_tokens_from_html(scope_html)
+    best_dom: str | None = None
+    if dom_refs:
+        def _ref_dom_score(t: str) -> tuple:
+            ts = t.strip()
+            if re.fullmatch(r"\d{5,8}", ts):
+                return (4, len(ts))
+            if re.fullmatch(r"\d{9,12}", ts):
+                return (3, len(ts))
+            if re.search(r"[A-Za-z]", ts) and re.search(r"\d", ts):
+                return (2, len(ts))
+            return (1, len(ts))
+
+        best_dom = max(dom_refs, key=lambda t: _ref_dom_score(t))
+    url_ref = _extract_reference_from_url(url)
+    out["reference_number"] = (
+        _reference_from_feature_pairs(pairs)
+        or ref_inline
+        or best_dom
+        or url_ref
+    )
+    rf = str(out.get("reference_number") or "").strip()
+    if url_ref and rf and url_ref.upper() != rf.upper():
+        ul = url.lower()
+        if url_ref.lower() in ul and rf.lower() not in ul and token_plausible_property_reference(url_ref):
+            out["reference_number"] = url_ref
     out["property_type"] = pairs.get("property type")
     if not out.get("property_type"):
         # Try nearby heading text like "Villa", "Apartment"
@@ -425,7 +742,72 @@ def _deterministic_property_extract(html: str, url: str) -> dict:
     out["yard"] = pairs.get("yard")
     out["roof"] = pairs.get("roof")
     out["terrace"] = pairs.get("terraces") or pairs.get("terrace")
-    out["total_sqm"] = _to_float_if_possible(pairs.get("total size (m2)") or pairs.get("total size"))
+    out["internal_sqm"] = (
+        _pair_float_first(
+            pairs,
+            "internal size (m2)",
+            "internal size",
+            "internal area (m2)",
+            "internal area",
+            "interior size (m2)",
+            "interior area (m2)",
+            "living area (m2)",
+            "living area",
+            "internal floor area (m2)",
+        )
+        or _pair_float_matching(
+            pairs,
+            must="internal",
+            must_not=("external", "total", "plot", "price"),
+            any_of=("size", "area", "m2", "sqm", "meter"),
+        )
+    )
+    out["external_sqm"] = (
+        _pair_float_first(
+            pairs,
+            "external size (m2)",
+            "external size",
+            "external area (m2)",
+            "external area",
+            "terrace area (m2)",
+            "balcony area (m2)",
+        )
+        or _pair_float_matching(
+            pairs,
+            must="external",
+            must_not=("internal",),
+            any_of=("size", "area", "m2", "sqm", "meter"),
+        )
+    )
+    out["total_sqm"] = (
+        _pair_float_first(
+            pairs,
+            "total size (m2)",
+            "total size",
+            "total area (m2)",
+            "total area",
+            "total floor area (m2)",
+            "gross internal area (m2)",
+            "property size (m2)",
+            "built up area (m2)",
+            "built-up area (m2)",
+        )
+        or _pair_float_matching(
+            pairs,
+            must="total",
+            must_not=("internal", "external", "plot", "price"),
+            any_of=("size", "area", "m2", "sqm", "meter"),
+        )
+    )
+    fl_raw = pairs.get("floor level") or pairs.get("floor") or pairs.get("level") or pairs.get("which floor")
+    if fl_raw:
+        fs = str(fl_raw).strip()
+        if fs and re.search(r"[^\d.\s]", fs):
+            out["floor_level"] = fs
+        else:
+            fn = _to_int_if_possible(fs)
+            if fn is not None and out.get("floor_number") is None:
+                out["floor_number"] = fn
     out["has_pool"] = (pairs.get("swimming pool") or "").lower() in ("yes", "true", "1")
     out["has_airconditioning"] = (pairs.get("airconditioning") or "").lower() in ("yes", "true", "1")
     m_price = re.search(r"(€\s*[\d,]+(?:\.\d+)?)", text)
@@ -443,21 +825,64 @@ def _deterministic_property_extract(html: str, url: str) -> dict:
     out["heating"] = pairs.get("heating")
     out["balconies"] = pairs.get("balconies") or pairs.get("terraces")
 
-    # Images: prefer og:image then property gallery images on same host.
-    og_img = soup.select_one("meta[property='og:image'], meta[name='og:image']")
+    bd_map, bt_map = _extract_room_dimension_maps_from_pairs(pairs)
+    if bd_map:
+        out["bedroom_dims"] = bd_map
+    if bt_map:
+        out["bathroom_dims"] = bt_map
+
+    # Images: prefer in-page gallery inside main listing scope; avoid site-wide og:image first.
+    scope = content_scope or soup.body
     imgs: list[str] = []
-    if og_img and og_img.get("content"):
-        imgs.append(urljoin(url, str(og_img.get("content")).strip()))
-    for im in soup.select("img[src]"):
-        src = (im.get("src") or "").strip()
-        if not src:
-            continue
-        full = urljoin(url, src)
-        low = full.lower()
-        if any(x in low for x in ("logo", "icon", "sprite", "placeholder")):
-            continue
-        if any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
-            imgs.append(full)
+    seen_img: set[str] = set()
+    gallery_selectors = (
+        ".property-gallery img[src]",
+        ".gallery img[src]",
+        ".swiper-slide img[src]",
+        ".slick-slide img[src]",
+        ".carousel img[src]",
+        "[class*='gallery'] img[src]",
+        "[class*='slider'] img[src]",
+        ".fotorama__stage img[src]",
+        ".photos img[src]",
+        ".property-images img[src]",
+    )
+    for sel in gallery_selectors:
+        for im in scope.select(sel):
+            src = (im.get("src") or "").strip()
+            if not src or src.startswith("data:"):
+                continue
+            full = urljoin(url, src)
+            low = full.lower()
+            if any(x in low for x in ("logo", "icon", "sprite", "placeholder", "avatar", "favicon")):
+                continue
+            if not any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                continue
+            if full not in seen_img:
+                seen_img.add(full)
+                imgs.append(full)
+    if not imgs:
+        og_scope = scope.select_one("meta[property='og:image'], meta[name='og:image']") or soup.select_one(
+            "meta[property='og:image'], meta[name='og:image']"
+        )
+        if og_scope and og_scope.get("content"):
+            ou = urljoin(url, str(og_scope.get("content")).strip())
+            if ou not in seen_img:
+                seen_img.add(ou)
+                imgs.append(ou)
+    if not imgs:
+        for im in scope.select("img[src]"):
+            src = (im.get("src") or "").strip()
+            if not src or src.startswith("data:"):
+                continue
+            full = urljoin(url, src)
+            low = full.lower()
+            if any(x in low for x in ("logo", "icon", "sprite", "placeholder", "avatar")):
+                continue
+            if any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                if full not in seen_img:
+                    seen_img.add(full)
+                    imgs.append(full)
     if imgs:
         dedup = list(dict.fromkeys(imgs))
         out["all_images"] = dedup[:20]
@@ -480,6 +905,7 @@ _NUMERIC_ZERO_EMPTY_KEYS = {
     "bedrooms",
     "bathrooms",
     "internal_sqm",
+    "external_sqm",
     "total_sqm",
     "kitchens",
     "living_rooms",
@@ -498,9 +924,20 @@ _DETERMINISTIC_PRIORITY_KEYS = {
     "sitting_room",
     "hallway",
     "garage_capacity",
+    "internal_sqm",
+    "external_sqm",
     "total_sqm",
+    "floor_level",
+    "floor_number",
     "property_type",
     "category",
+    "bedroom_dims",
+    "bathroom_dims",
+    "agent_name",
+    "agent_phone",
+    "agent_email",
+    "main_image",
+    "all_images",
 }
 
 
@@ -517,6 +954,8 @@ def _is_empty_like_for_merge(v, key: str | None = None) -> bool:
             return True
         return False
     if isinstance(v, list):
+        return len(v) == 0
+    if isinstance(v, dict):
         return len(v) == 0
     return False
 
@@ -610,30 +1049,189 @@ async def extract_property_urls_from_listing(listing_url: str) -> dict:
     return out
 
 
+_VISION_TOPUP_KEYS = (
+    "reference_number",
+    "title",
+    "property_type",
+    "bedrooms",
+    "bathrooms",
+    "internal_sqm",
+    "external_sqm",
+    "total_sqm",
+    "floor_level",
+    "locality",
+    "price_text",
+    "price",
+    "currency",
+    "agent_name",
+    "agent_phone",
+    "owner_name",
+    "owner_phone",
+    "price_per_night",
+    "price_per_month",
+    "has_wifi",
+)
+
+
+def _needs_vision_topup(row: dict) -> bool:
+    """Run screenshot model when HTML path still lacks a plausible ref or title."""
+    ref = str(row.get("reference_number") or row.get("reference") or "").strip()
+    if ref and token_plausible_property_reference(ref):
+        return False
+    tit = str(row.get("title") or "").strip()
+    if len(tit) >= 10:
+        return False
+    return True
+
+
+async def _vision_fill_sparse_property(listing_url: str, jpeg_bytes: bytes) -> dict[str, object]:
+    """GPT-4o-family vision pass for sites where ref/title live only in rendered layout."""
+    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    data_url = f"data:image/jpeg;base64,{b64}"
+    user_txt = f"""Context URL: {listing_url}
+
+This JPEG is the top of a property listing page in a browser.
+Return ONLY valid JSON (no markdown). Use null for anything not clearly readable.
+
+{{
+  "reference_number": null,
+  "title": null,
+  "property_type": null,
+  "bedrooms": null,
+  "bathrooms": null,
+  "internal_sqm": null,
+  "external_sqm": null,
+  "total_sqm": null,
+  "floor_level": null,
+  "locality": null,
+  "price_text": null,
+  "currency": null,
+  "agent_name": null,
+  "agent_phone": null,
+  "owner_name": null,
+  "owner_phone": null,
+  "price_per_night": null,
+  "price_per_month": null,
+  "has_wifi": null
+}}
+
+reference_number: listing / property ID (often near labels like Ref, Reference, Ref |, Property ID, ID). 4–8 digit numbers and short alphanumeric codes are common and valid.
+property_type: short English label (Apartment, Villa, Hotel, Penthouse, etc.).
+bedrooms / bathrooms / internal_sqm / external_sqm / total_sqm: JSON numbers only when clearly shown (m² / sqm labels).
+floor_level: string or number as printed (e.g. "3rd", "Ground", "Level 2") when visible.
+agent_* = estate agent; owner_* = property owner/vendor if clearly separate on the page.
+has_wifi: true/false only if clearly stated.
+"""
+    vision_model = "gpt-4o-mini"
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    response = await client.chat.completions.create(
+        model=vision_model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You read real-estate listing screenshots and return compact JSON only.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_txt},
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}},
+                ],
+            },
+        ],
+        max_tokens=900,
+        temperature=0,
+    )
+    raw = response.choices[0].message.content or ""
+    parsed = parse_json_safely(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _reference_from_mailto_query_blob(extracted: dict[str, object]) -> str | None:
+    """mailto:?subject=…&body=<listing URL> — recover property id from body when ref is missing."""
+    v = extracted.get("agent_email")
+    if not isinstance(v, str) or "body=" not in v.lower():
+        return None
+    try:
+        s = v.strip()
+        low = s.lower()
+        if low.startswith("mailto:"):
+            i = s.find("?")
+            q = s[i + 1 :] if i >= 0 else ""
+        elif s.startswith("?"):
+            q = s[1:]
+        else:
+            q = s
+        body_val = None
+        for k2, val in parse_qsl(q, keep_blank_values=True):
+            if k2.lower() == "body":
+                body_val = val
+                break
+        if not body_val:
+            return None
+        listing_url = unquote(body_val.strip())
+        uref = _extract_reference_from_url(listing_url)
+        if uref and token_plausible_property_reference(uref):
+            return uref
+        m = re.search(r"-(\d{4,12})(?:/|$)", listing_url, re.I)
+        if m:
+            tok = m.group(1)
+            if tok and token_plausible_property_reference(tok):
+                return tok
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_phone_fields_inplace(data: dict[str, object]) -> None:
+    """Decode tel: / pasted values where spaces became %20 in the string."""
+    for k in ("agent_phone", "owner_phone"):
+        n = normalize_phone_display(data.get(k))
+        if n:
+            data[k] = n
+
+
+def _sanitize_email_fields_inplace(data: dict[str, object]) -> None:
+    """Drop mailto query junk (?subject=&body=) and keep only real addresses."""
+    for k in ("agent_email", "owner_email"):
+        if k not in data:
+            continue
+        data[k] = sanitize_email_field(data.get(k))
+
+
 async def extract_property_detail_universal(property_url: str, take_screenshot: bool = False) -> dict:
     """
     Scrape one property URL and run comprehensive LLM extraction.
-    take_screenshot reserved for future Playwright screenshot augmentation.
+    When take_screenshot is True (workbench extract-single), uses Playwright with an optional
+    JPEG screenshot and a small vision model pass if the HTML pipeline still misses ref/title.
     """
     url = _normalize_listing_url(property_url)
     html = ""
+    jpeg_bytes: bytes | None = None
     # Deep-extract path requests Playwright-backed fetch to get fully rendered listing details.
     if take_screenshot:
         try:
-            r2 = await scrape_level2(url)
+            r2 = await scrape_level2(url, capture_screenshot=True)
             html = (r2.get("html") or "").strip()
+            shot = r2.get("screenshot_jpeg")
+            if isinstance(shot, (bytes, bytearray)):
+                jpeg_bytes = bytes(shot)
             if not html:
                 logger.warning("Playwright returned empty HTML for %s; falling back to ScraperEngine", url)
         except Exception as exc:
             logger.warning("Playwright scrape failed for %s (%s); falling back to ScraperEngine", url, exc)
             html = ""
-    if not html:
+    playwright_thin = take_screenshot and bool(html) and len(html) < 4000
+    if not html or playwright_thin:
         try:
             r = await _engine.scrape(url)
+            h2 = (r.get("html") or "").strip()
+            if h2 and (not html or len(h2) > len(html)):
+                html = h2
         except Exception as exc:
             logger.exception("extract_property_detail_universal scrape failed")
-            return {"error": str(exc), "listing_url": url}
-        html = (r.get("html") or "").strip()
+            if not html:
+                return {"error": str(exc), "listing_url": url}
 
     if not html or len(html.strip()) < 200:
         return {"error": "Empty or minimal HTML", "listing_url": url}
@@ -643,6 +1241,8 @@ async def extract_property_detail_universal(property_url: str, take_screenshot: 
         if deterministic:
             deterministic["_source_url"] = url
             deterministic["_scraped_at"] = datetime.now(timezone.utc).isoformat()
+            _normalize_phone_fields_inplace(deterministic)
+            _sanitize_email_fields_inplace(deterministic)
             return deterministic
         return {"error": "OPENAI_API_KEY is not configured", "listing_url": url}
 
@@ -705,6 +1305,8 @@ async def extract_property_detail_universal(property_url: str, take_screenshot: 
         if deterministic:
             deterministic["_source_url"] = url
             deterministic["_scraped_at"] = datetime.now(timezone.utc).isoformat()
+            _normalize_phone_fields_inplace(deterministic)
+            _sanitize_email_fields_inplace(deterministic)
             return deterministic
         return {"error": "LLM returned empty or invalid JSON", "listing_url": url}
 
@@ -722,8 +1324,46 @@ async def extract_property_detail_universal(property_url: str, take_screenshot: 
     extracted.setdefault("listing_url", url)
     extracted["_source_url"] = url
     extracted["_scraped_at"] = datetime.now(timezone.utc).isoformat()
-    ref = extracted.get("reference_number") or extracted.get("reference") or _extract_reference_from_url(url)
-    if ref is not None:
-        extracted.setdefault("reference_number", ref)
+    rn = extracted.get("reference_number") or extracted.get("reference")
+    url_ref = _extract_reference_from_url(url)
+    out_ref: str | None = None
+    if isinstance(rn, str) and rn.strip():
+        s = rn.strip()
+        out_ref = s if token_plausible_property_reference(s) else (url_ref or s)
+    elif rn not in (None, ""):
+        out_ref = str(rn).strip() or None
+    if out_ref is None:
+        out_ref = url_ref
+    if out_ref is not None:
+        extracted["reference_number"] = out_ref
+    cur_ref = str(extracted.get("reference_number") or "").strip()
+    mail_ref = _reference_from_mailto_query_blob(extracted)
+    if mail_ref and token_plausible_property_reference(mail_ref):
+        if not cur_ref or not token_plausible_property_reference(cur_ref):
+            extracted["reference_number"] = mail_ref
 
+    if take_screenshot and jpeg_bytes and settings.openai_api_key and _needs_vision_topup(extracted):
+        try:
+            patch = await _vision_fill_sparse_property(url, jpeg_bytes)
+            for k in _VISION_TOPUP_KEYS:
+                if k not in patch:
+                    continue
+                pv = patch[k]
+                if k == "reference_number":
+                    if not isinstance(pv, str) or not pv.strip():
+                        continue
+                    pvs = pv.strip()
+                    if not token_plausible_property_reference(pvs):
+                        continue
+                    cur = str(extracted.get("reference_number") or "").strip()
+                    if not cur or not token_plausible_property_reference(cur):
+                        extracted["reference_number"] = pvs
+                    continue
+                if _is_empty_like_for_merge(extracted.get(k), k) and not _is_empty_like_for_merge(pv, k):
+                    extracted[k] = pv
+        except Exception as exc:
+            logger.warning("Vision listing top-up failed for %s: %s", url, exc)
+
+    _normalize_phone_fields_inplace(extracted)
+    _sanitize_email_fields_inplace(extracted)
     return extracted

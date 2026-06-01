@@ -49,29 +49,3 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Backward-compatible schema guard for older deployments.
-        await conn.execute(
-            text("ALTER TABLE agencies ADD COLUMN IF NOT EXISTS property_categories TEXT[]")
-        )
-        # conversation_embeddings / legacy DB column guards (see add_memory_tables.sql)
-        await conn.execute(
-            text(
-                """
-                DO $guard$
-                BEGIN
-                  IF EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                      AND table_name = 'conversation_embeddings'
-                  ) THEN
-                    ALTER TABLE conversation_embeddings
-                      ADD COLUMN IF NOT EXISTS session_id TEXT DEFAULT '';
-                    ALTER TABLE conversation_embeddings
-                      ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';
-                    ALTER TABLE conversation_embeddings
-                      ADD COLUMN IF NOT EXISTS message TEXT DEFAULT '';
-                  END IF;
-                END $guard$;
-                """
-            )
-        )

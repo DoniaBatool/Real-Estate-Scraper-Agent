@@ -1,0 +1,11 @@
+{
+  "framework": "nextjs",
+  "functions": {
+    "app/api/stagehand/scrape-url/route.ts": { "maxDuration": 300 },
+    "app/api/stagehand/search/route.ts":     { "maxDuration": 120 },
+    "app/api/stagehand/property-details/route.ts": { "maxDuration": 120 }
+  },
+  "env": {
+    "STAGEHAND_ENV": "BROWSERBASE"
+  }
+}

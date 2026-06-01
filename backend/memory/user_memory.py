@@ -65,7 +65,7 @@ async def store_conversation_embedding(
                   (session_id, user_fingerprint,
                    role, message, embedding, metadata)
                 VALUES
-                  (:sid, :fp, :role, :msg, :emb::vector, '{}'::jsonb)
+                  (:sid, :fp, :role, :msg, CAST(:emb AS vector), '{}'::jsonb)
             """), {
                 "sid": sid,
                 "fp": user_fingerprint,
@@ -125,7 +125,7 @@ async def _get_similar_messages(
             FROM conversation_embeddings
             WHERE user_fingerprint = :fp
               AND embedding IS NOT NULL
-            ORDER BY embedding <=> :emb::vector ASC
+            ORDER BY embedding <=> CAST(:emb AS vector) ASC
             LIMIT :limit
         """), {
             "fp": user_fingerprint,
@@ -141,6 +141,10 @@ async def _get_similar_messages(
 
     except Exception as exc:
         logger.warning("RAG retrieval error: %s", exc)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         return []
 
 
@@ -189,13 +193,10 @@ async def build_personalized_context(
     if not user_fingerprint:
         return "", {}
 
-    # Run memory + RAG in parallel
-    import asyncio
-    memory, similar = await asyncio.gather(
-        _get_user_memory(db, user_fingerprint),
-        _get_similar_messages(
-            db, user_fingerprint, current_message
-        ),
+    # Run sequentially — asyncpg sessions don't support concurrent operations
+    memory = await _get_user_memory(db, user_fingerprint)
+    similar = await _get_similar_messages(
+        db, user_fingerprint, current_message
     )
 
     if not memory and not similar:
@@ -220,16 +221,6 @@ async def build_personalized_context(
                 f"Previously looking for: {memory['summary']}"
             )
             meta["summary"] = memory["summary"]
-
-        last_city = memory.get("last_city")
-        last_country = memory.get("last_country")
-        if last_city and last_country:
-            profile_lines.append(
-                f"Last searched: {last_city}, {last_country}"
-            )
-            meta["last_location"] = (
-                f"{last_city}, {last_country}"
-            )
 
         cities = memory.get("preferred_cities") or []
         if cities:
@@ -398,65 +389,36 @@ Conversation:
         if existing:
             await db.execute(text("""
                 UPDATE user_memory SET
-                  preferred_cities = :cities,
-                  preferred_countries = :countries,
+                  preferred_cities        = :cities,
+                  preferred_countries     = :countries,
                   preferred_property_types = :types,
-                  preferred_localities = :localities,
-                  min_budget = COALESCE(
-                    :min_b, min_budget),
-                  max_budget = COALESCE(
-                    :max_b, max_budget),
-                  currency = COALESCE(
-                    :curr, currency),
-                  min_bedrooms = COALESCE(
-                    :beds, min_bedrooms),
+                  preferred_localities    = :localities,
+                  min_budget         = COALESCE(:min_b, min_budget),
+                  max_budget         = COALESCE(:max_b, max_budget),
+                  currency           = COALESCE(:curr, currency),
+                  min_bedrooms       = COALESCE(:beds, min_bedrooms),
                   investment_interest = :invest,
-                  rental_interest = :rental,
-                  language = COALESCE(
-                    :lang, language),
-                  last_city = COALESCE(
-                    :lcity, last_city),
-                  last_country = COALESCE(
-                    :lctry, last_country),
-                  summary = COALESCE(
-                    :summ, summary),
-                  total_conversations = (
-                    total_conversations + 1),
-                  last_seen = NOW(),
+                  rental_interest    = :rental,
+                  language           = COALESCE(:lang, language),
+                  summary            = COALESCE(:summ, summary),
+                  total_conversations = (total_conversations + 1),
+                  last_seen  = NOW(),
                   updated_at = NOW()
                 WHERE user_fingerprint = :fp
             """), {
-                "fp": user_fingerprint,
-                "cities": _merge(
-                    existing.get("preferred_cities"),
-                    prefs.get("preferred_cities")
-                ),
-                "countries": _merge(
-                    existing.get("preferred_countries"),
-                    prefs.get("preferred_countries")
-                ),
-                "types": _merge(
-                    existing.get("preferred_property_types"),
-                    prefs.get("preferred_property_types")
-                ),
-                "localities": _merge(
-                    existing.get("preferred_localities"),
-                    prefs.get("preferred_localities")
-                ),
-                "min_b": prefs.get("min_budget"),
-                "max_b": prefs.get("max_budget"),
-                "curr": prefs.get("currency"),
-                "beds": prefs.get("min_bedrooms"),
-                "invest": bool(
-                    prefs.get("investment_interest")
-                ),
-                "rental": bool(
-                    prefs.get("rental_interest")
-                ),
-                "lang": prefs.get("language"),
-                "lcity": prefs.get("last_city"),
-                "lctry": prefs.get("last_country"),
-                "summ": prefs.get("summary"),
+                "fp":        user_fingerprint,
+                "cities":    list(_merge(existing.get("preferred_cities"), prefs.get("preferred_cities"))),
+                "countries": list(_merge(existing.get("preferred_countries"), prefs.get("preferred_countries"))),
+                "types":     list(_merge(existing.get("preferred_property_types"), prefs.get("preferred_property_types"))),
+                "localities":list(_merge(existing.get("preferred_localities"), prefs.get("preferred_localities"))),
+                "min_b":  prefs.get("min_budget"),
+                "max_b":  prefs.get("max_budget"),
+                "curr":   prefs.get("currency"),
+                "beds":   prefs.get("min_bedrooms"),
+                "invest": bool(prefs.get("investment_interest")),
+                "rental": bool(prefs.get("rental_interest")),
+                "lang":   prefs.get("language"),
+                "summ":   prefs.get("summary"),
             })
 
         else:
@@ -464,52 +426,33 @@ Conversation:
                 INSERT INTO user_memory (
                   user_fingerprint,
                   preferred_cities, preferred_countries,
-                  preferred_property_types,
-                  preferred_localities,
+                  preferred_property_types, preferred_localities,
                   min_budget, max_budget, currency,
                   min_bedrooms, investment_interest,
-                  rental_interest, language,
-                  last_city, last_country, summary,
+                  rental_interest, language, summary,
                   total_conversations, last_seen
                 ) VALUES (
                   :fp,
-                  :cities, :countries, :types,
-                  :localities,
+                  :cities, :countries,
+                  :types, :localities,
                   :min_b, :max_b, :curr,
-                  :beds, :invest, :rental, :lang,
-                  :lcity, :lctry, :summ,
+                  :beds, :invest, :rental, :lang, :summ,
                   1, NOW()
                 )
             """), {
-                "fp": user_fingerprint,
-                "cities": (
-                    prefs.get("preferred_cities") or []
-                ),
-                "countries": (
-                    prefs.get("preferred_countries") or []
-                ),
-                "types": (
-                    prefs.get(
-                        "preferred_property_types"
-                    ) or []
-                ),
-                "localities": (
-                    prefs.get("preferred_localities") or []
-                ),
-                "min_b": prefs.get("min_budget"),
-                "max_b": prefs.get("max_budget"),
-                "curr": prefs.get("currency"),
-                "beds": prefs.get("min_bedrooms"),
-                "invest": bool(
-                    prefs.get("investment_interest", False)
-                ),
-                "rental": bool(
-                    prefs.get("rental_interest", False)
-                ),
-                "lang": prefs.get("language", "english"),
-                "lcity": prefs.get("last_city"),
-                "lctry": prefs.get("last_country"),
-                "summ": prefs.get("summary"),
+                "fp":        user_fingerprint,
+                "cities":    list(prefs.get("preferred_cities") or []),
+                "countries": list(prefs.get("preferred_countries") or []),
+                "types":     list(prefs.get("preferred_property_types") or []),
+                "localities":list(prefs.get("preferred_localities") or []),
+                "min_b":  prefs.get("min_budget"),
+                "max_b":  prefs.get("max_budget"),
+                "curr":   prefs.get("currency"),
+                "beds":   prefs.get("min_bedrooms"),
+                "invest": bool(prefs.get("investment_interest", False)),
+                "rental": bool(prefs.get("rental_interest", False)),
+                "lang":   prefs.get("language", "english"),
+                "summ":   prefs.get("summary"),
             })
 
         await db.commit()

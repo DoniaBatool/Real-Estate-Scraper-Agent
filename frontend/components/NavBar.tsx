@@ -2,17 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Building2 } from "lucide-react";
+import { Bot, Sparkles } from "lucide-react";
 
 const NAV_LINKS = [
   { href: "/", label: "Home" },
-  { href: "/chat", label: "Chat" },
-  { href: "/about-aria", label: "About ARIA" },
-  { href: "/agencies", label: "Agencies" },
-  { href: "/properties", label: "Properties" },
-  { href: "/pricing", label: "Pricing" },
-  { href: "/workbench", label: "🔬 Workbench" },
-  { href: "/workbench/extract", label: "⚡ Extractor" },
+  { href: "/chat", label: "Chat with ARIA" },
 ];
 
 export default function NavBar() {
@@ -56,14 +50,14 @@ export default function NavBar() {
               width: 32,
               height: 32,
               borderRadius: 8,
-              background: "linear-gradient(135deg, #1d4ed8, #2563eb)",
+              background: "linear-gradient(135deg, #92400e, #d97706, #f59e0b)",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              boxShadow: "0 0 12px rgba(37,99,235,0.4)",
+              boxShadow: "0 0 14px rgba(245,158,11,0.45)",
             }}
           >
-            <Building2 size={16} color="white" />
+            <Bot size={17} color="white" />
           </div>
           <span
             style={{
@@ -73,18 +67,43 @@ export default function NavBar() {
               letterSpacing: "-0.01em",
             }}
           >
-            RE{" "}
-            <span style={{ color: "var(--accent-gold)" }}>Intelligence</span>
+            ARIA{" "}
+            <span style={{ color: "var(--accent-gold)", fontWeight: 400 }}>Real Estate</span>
           </span>
         </Link>
 
         {/* Nav links */}
-        <div style={{ display: "flex", gap: "0.25rem", marginLeft: "auto" }}>
+        <div style={{ display: "flex", gap: "0.25rem", marginLeft: "auto", alignItems: "center" }}>
           {NAV_LINKS.map((link) => {
-            const active =
-              link.href === "/workbench"
-                ? pathname.startsWith("/workbench")
-                : pathname === link.href;
+            const active = pathname === link.href;
+            const isChat = link.href === "/chat";
+            if (isChat) {
+              return (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "0.45rem 1.1rem",
+                    borderRadius: 8,
+                    fontSize: "0.875rem",
+                    fontWeight: 600,
+                    color: "#fff",
+                    background: active
+                      ? "linear-gradient(135deg, #92400e, #d97706)"
+                      : "linear-gradient(135deg, #1d4ed8, #2563eb)",
+                    textDecoration: "none",
+                    boxShadow: "0 0 14px rgba(37,99,235,0.35)",
+                    transition: "all 0.2s",
+                  }}
+                >
+                  <Sparkles size={13} />
+                  Chat with ARIA
+                </Link>
+              );
+            }
             return (
               <Link
                 key={link.href}
@@ -107,7 +126,7 @@ export default function NavBar() {
           })}
         </div>
 
-        {/* Status dot */}
+        {/* Live status */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 8 }}>
           <div
             style={{
@@ -116,7 +135,7 @@ export default function NavBar() {
               borderRadius: "50%",
               background: "#22c55e",
               boxShadow: "0 0 6px #22c55e",
-              animation: "pulse 2s infinite",
+              animation: "navpulse 2s infinite",
             }}
           />
           <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Live</span>
@@ -124,7 +143,7 @@ export default function NavBar() {
       </div>
 
       <style>{`
-        @keyframes pulse {
+        @keyframes navpulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.4; }
         }

@@ -8,7 +8,7 @@ import logging
 import re
 from collections import deque
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -20,72 +20,29 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-from backend.ai.extractor import call_openai, parse_json_safely, parse_json_universal
+from backend.ai.extractor import parse_json_safely
 from backend.config import settings
 from backend.database.connection import _get_engine
 from backend.database import crud
 from backend.discovery.apify_client import discover_agencies_sync
 from backend.scraper.engine import ScraperEngine
+from backend.scraper.reference_sniffer import collect_reference_tokens_from_html
 
 logger = logging.getLogger(__name__)
-
-# Run in browser after "Show full description" — reads expanded About This Home text from the live DOM.
-_HOQ_LIVE_ABOUT_DESC_JS = """
-() => {
-  const clean = (s) => (s || "").replace(/\\r/g, "").trim();
-  const stripToggle = (t) =>
-    t.replace(/\\s*(show|hide)\\s+full\\s+description\\s*/gi, " ").replace(/\\s+/g, " ").trim();
-
-  const heads = Array.from(document.querySelectorAll("h1, h2, h3, h4"));
-  for (const h of heads) {
-    if (!/about\\s+this\\s+home/i.test(clean(h.textContent || ""))) continue;
-
-    let el = h.nextElementSibling;
-    const parts = [];
-    while (el) {
-      const tag = (el.tagName || "").toLowerCase();
-      if (/^h[1-4]$/.test(tag)) {
-        const ht = clean(el.textContent || "");
-        if (!/about\\s+this\\s+home/i.test(ht)) break;
-      }
-      const block = clean(el.innerText || el.textContent || "");
-      if (block.length > 40 && !/^show\\s+full\\s+description$/i.test(block)) parts.push(block);
-      el = el.nextElementSibling;
-    }
-    if (parts.length) {
-      const nl = String.fromCharCode(10);
-      const joined = stripToggle(parts.join(nl + nl));
-      if (joined.length >= 120) return joined;
-    }
-
-    const sec = h.closest("section") || h.closest("article") || h.parentElement;
-    if (!sec) continue;
-    const c = sec.cloneNode(true);
-    c.querySelectorAll("script, style, noscript").forEach((n) => n.remove());
-    c.querySelectorAll("a, button, [role='button']").forEach((n) => {
-      const tx = clean(n.textContent || "");
-      if (/show|hide\\s+full\\s+description/i.test(tx)) n.remove();
-    });
-    let out = clean(c.innerText || "");
-    out = out.replace(/^[\\s\\n]*about\\s+this\\s+home\\s*/i, "");
-    out = stripToggle(out);
-    if (out.length >= 120) return out;
-  }
-  return null;
-}
-"""
-
-
-def _hoq_normalize_about_description(text: str) -> str:
-    t = text.strip()
-    t = re.sub(r"(?im)^\s*(show|hide)\s+full\s+description\s*$", "", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
 
 router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 
 _engine_singleton = ScraperEngine()
+
+
+def _urls_containing_reference(ref: str, urls: list[str], *, limit: int = 80) -> list[str]:
+    """Internal links whose path/query contains this reference substring (case-insensitive)."""
+    if not ref or not urls:
+        return []
+    rlow = ref.lower()
+    hits = [u for u in urls if rlow in u.lower()]
+    return hits[:limit]
+
 
 COMPREHENSIVE_EXTRACT_PROMPT = """
 You are an expert web data extractor.
@@ -105,7 +62,7 @@ INSTRUCTIONS:
    e.g. "price_eur", "floor_number", "agent_name"
 
 For real estate pages, look for:
-- reference_number (REF: XXXX)
+- reference_number (REF:, Property ID, or UUID in URL path e.g. /listings/bd199e03-16e1-4dad-ac3e-658adced81ad)
 - title, subtitle
 - price (number only), price_text (formatted)
 - currency
@@ -140,6 +97,10 @@ For real estate pages, look for:
 - agent_phone
 - agent_email
 - agency_name
+- owner_name, owner_phone, owner_email (property vendor / landlord / seller — NOT the estate agent)
+- price_per_night (numeric nightly rent if shown, e.g. holiday lets)
+- price_per_month (numeric monthly rent if shown)
+- has_wifi (bool) when the page states WiFi / internet included
 - listing_date
 - last_updated
 - views_count
@@ -165,6 +126,7 @@ RULES:
 - Numbers as numbers (not strings)
 - Full URLs for images (not relative)
 - Return ONLY valid JSON, no markdown
+- AGENT vs OWNER: If both appear, put the estate-agency representative in agent_name/agent_phone/agent_email and the property owner/vendor/landlord in owner_name/owner_phone/owner_email. If only one person is shown, follow the on-page label ("Agent", "Listed by", "Owner", "Vendor"); if still unclear, use agent_* and leave owner_* null.
 
 Page URL: {url}
 
@@ -259,6 +221,120 @@ def _should_enqueue_for_crawl(href: str) -> bool:
     if "mailto:" in href or "tel:" in href:
         return False
     return True
+
+
+# When the homepage is a SPA shell or slow to hydrate, try these paths on the same host.
+_CRAWL_SEED_PATHS: tuple[str, ...] = (
+    "/properties",
+    "/property",
+    "/property-search",
+    "/listings",
+    "/for-sale",
+    "/for-rent",
+    "/buy",
+    "/rent",
+    "/search",
+    "/results",
+    "/all-properties",
+    "/en/properties",
+    "/en/for-sale",
+    "/en/for-rent",
+    "/our-properties",
+    "/listings-for-sale",
+    "/properties-for-sale",
+    "/property-for-sale",
+    "/property-for-rent",
+    "/residential",
+    "/commercial",
+)
+
+
+def _heuristic_listing_seed_urls(base_url: str) -> list[str]:
+    u = (base_url or "").strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    try:
+        p = urlparse(u)
+        origin = f"{p.scheme}://{p.netloc}"
+    except Exception:
+        return []
+    out: list[str] = []
+    for path in _CRAWL_SEED_PATHS:
+        full = urljoin(origin + "/", path)
+        if full not in out:
+            out.append(full)
+    return out
+
+
+def _ingest_hrefs_into_crawl(
+    base_for_join: str,
+    href_text_pairs: list[tuple[str, str]],
+    merged: dict[str, dict],
+    queue: deque[str],
+    scheduled: set[str],
+    visited_ok: set[str],
+    failed_keys: set[str],
+    crawl_domain: str,
+) -> None:
+    """Resolve relative hrefs, store internal links, enqueue for BFS."""
+    for raw_href, tx in href_text_pairs:
+        href = (raw_href or "").strip()
+        if not href:
+            continue
+        if href.startswith("#"):
+            continue
+        if not _should_enqueue_for_crawl(href):
+            continue
+        try:
+            abs_url = urljoin(base_for_join.rstrip("/") + "/", href)
+        except Exception:
+            continue
+        if not _is_internal(abs_url, crawl_domain):
+            continue
+        clean = abs_url.split("#")[0].strip()
+        if not clean:
+            continue
+        _store_link(merged, clean, (tx or "")[:80], False)
+        if not _should_enqueue_for_crawl(clean):
+            continue
+        ck = _norm_crawl_key(clean)
+        if (
+            ck
+            and ck not in visited_ok
+            and ck not in failed_keys
+            and ck not in scheduled
+            and len(queue) < 8000
+        ):
+            scheduled.add(ck)
+            queue.append(clean)
+
+
+async def _try_dismiss_cookie_banners(page) -> None:
+    """Best-effort: sites that hide nav until consent is clicked."""
+    labels = (
+        "Accept all cookies",
+        "Accept all",
+        "Accept Cookies",
+        "Accept",
+        "I Agree",
+        "Agree",
+        "Allow all",
+        "Allow all cookies",
+        "OK",
+        "Got it",
+    )
+    for lbl in labels:
+        try:
+            await page.get_by_role("button", name=re.compile(re.escape(lbl), re.I)).first.click(timeout=900)
+            await page.wait_for_timeout(600)
+            return
+        except Exception:
+            continue
+    try:
+        await page.locator("text=/^\\s*Accept\\s*$/i").first.click(timeout=700)
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 
 def _store_link(store: dict[str, dict], url: str, text: str, is_nav: bool) -> None:
@@ -507,6 +583,7 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
     merged: dict[str, dict] = {}
     playwright_error: str | None = None
     pages_visited = 0
+    discovered_refs: set[str] = set()
 
     try:
         from playwright.async_api import async_playwright
@@ -523,8 +600,23 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
         visited_ok: set[str] = set()
         failed_keys: set[str] = set()
 
+        for seed_extra in _heuristic_listing_seed_urls(base):
+            ck0 = _norm_crawl_key(seed_extra)
+            if not ck0 or ck0 in scheduled:
+                continue
+            if not _is_internal(seed_extra, domain):
+                continue
+            if not _should_enqueue_for_crawl(seed_extra):
+                continue
+            scheduled.add(ck0)
+            queue.append(seed_extra.split("#")[0].strip())
+            _store_link(merged, seed_extra.split("#")[0].strip(), "Heuristic listing index", False)
+
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
             try:
                 context = await browser.new_context(
                     viewport={"width": 1280, "height": 800},
@@ -544,8 +636,21 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
                         continue
 
                     try:
-                        await page.goto(page_url, wait_until="domcontentloaded", timeout=28_000)
-                        await page.wait_for_timeout(450)
+                        await page.goto(page_url, wait_until="load", timeout=32_000)
+                        await _try_dismiss_cookie_banners(page)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=5_000)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(1_000)
+                        try:
+                            await page.evaluate(
+                                "() => window.scrollTo(0, Math.min(1200, document.body.scrollHeight || 0))"
+                            )
+                            await page.wait_for_timeout(450)
+                        except Exception:
+                            pass
+
                         final_url = (page.url or page_url).strip()
                         final_host = urlparse(final_url).netloc or ""
                         if final_host and _is_internal(final_url, domain):
@@ -553,11 +658,35 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
 
                         link_objs = await page.evaluate(
                             """() => {
-                              const els = Array.from(document.querySelectorAll('a[href]'));
-                              return els.map(el => ({
-                                href: el.href,
-                                text: (el.innerText || '').trim().slice(0, 120),
-                              }));
+                              const seen = new Set();
+                              const out = [];
+                              const push = (href, text) => {
+                                if (!href || href.indexOf('http') !== 0) return;
+                                if (seen.has(href)) return;
+                                seen.add(href);
+                                out.push({
+                                  href,
+                                  text: (text || '').trim().slice(0, 120),
+                                });
+                              };
+                              for (const el of document.querySelectorAll('a[href]')) {
+                                push(el.href, el.innerText);
+                              }
+                              for (const el of document.querySelectorAll(
+                                '[data-href], [data-url], [data-link], [data-to]'
+                              )) {
+                                const raw =
+                                  el.getAttribute('data-href') ||
+                                  el.getAttribute('data-url') ||
+                                  el.getAttribute('data-link') ||
+                                  el.getAttribute('data-to');
+                                if (!raw || raw.indexOf('javascript:') === 0) continue;
+                                try {
+                                  const abs = new URL(raw, document.baseURI).href;
+                                  push(abs, el.textContent || el.getAttribute('aria-label') || '');
+                                } catch (e) {}
+                              }
+                              return out;
                             }"""
                         )
                     except Exception as nav_exc:
@@ -590,6 +719,33 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
                             scheduled.add(ck)
                             queue.append(clean)
 
+                    try:
+                        html_doc = await page.content()
+                        discovered_refs |= collect_reference_tokens_from_html(html_doc)
+                        soup = BeautifulSoup(html_doc, "html.parser")
+                        join_base = final_url.split("#")[0].strip() or page_url
+                        pairs: list[tuple[str, str]] = []
+                        for a in soup.find_all("a", href=True):
+                            raw = (a.get("href") or "").strip()
+                            if raw:
+                                pairs.append((raw, a.get_text(strip=True)[:80]))
+                        for ar in soup.select("area[href]"):
+                            raw = (ar.get("href") or "").strip()
+                            if raw:
+                                pairs.append((raw, ""))
+                        _ingest_hrefs_into_crawl(
+                            join_base,
+                            pairs,
+                            merged,
+                            queue,
+                            scheduled,
+                            visited_ok,
+                            failed_keys,
+                            crawl_domain,
+                        )
+                    except Exception:
+                        pass
+
                     await asyncio.sleep(0.28)
 
             finally:
@@ -612,6 +768,7 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
                 if r.status_code != 200:
                     r = await client.get(base)
                 if r.status_code == 200 and len(r.text) > 200:
+                    discovered_refs |= collect_reference_tokens_from_html(r.text)
                     soup = BeautifulSoup(r.text, "html.parser")
                     for a in soup.find_all("a", href=True):
                         raw = (a.get("href") or "").strip()
@@ -625,6 +782,13 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
 
     groups = _group_classified_links(merged, base)
     total = sum(len(v) for v in groups.values())
+
+    all_urls_list = sorted(merged.keys())
+    urls_by_reference: dict[str, list[str]] = {}
+    for ref in sorted(discovered_refs, key=len, reverse=True):
+        hits = _urls_containing_reference(ref, all_urls_list)
+        if hits:
+            urls_by_reference[ref] = hits
 
     warning: str | None = None
     if total == 0 and playwright_error:
@@ -640,8 +804,10 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
             )
     elif total == 0:
         warning = (
-            "No internal links matched filters. The homepage may be mostly JavaScript "
-            "or links point outside this domain."
+            "No internal links were collected after crawling (same-domain <a> / data-href links). "
+            "Try: paste a listings or properties index URL instead of only the homepage; "
+            "confirm the site does not block automated browsers; or increase Max pages after "
+            "the homepage loads navigation in JavaScript."
         )
 
     out: dict = {
@@ -651,7 +817,10 @@ async def workbench_fetch_urls(request: FetchUrlsRequest):
         "groups": groups,
         "pages_visited": pages_visited,
         "crawl_max_pages": max_pages,
-        "all_urls": sorted(merged.keys()),
+        "all_urls": all_urls_list,
+        # Reference tokens seen in crawled HTML (grids/cards), mapped to internal URLs that contain that substring.
+        "references_from_html": sorted(discovered_refs),
+        "urls_by_reference": urls_by_reference,
     }
     if warning:
         out["warning"] = warning
@@ -788,6 +957,10 @@ class QualifyPropertyUrlsBody(BaseModel):
 
 class MatchReferenceUrlsBody(BaseModel):
     reference: str = ""
+    title_hint: str = Field(
+        default="",
+        description="When reference is missing or weak, match URLs whose path contains title words / slug.",
+    )
     urls: list[str] = Field(default_factory=list)
     max_scan: int = Field(default=400, ge=1, le=2000)
     max_matches: int = Field(default=25, ge=1, le=200)
@@ -807,27 +980,61 @@ def _ref_variants(ref: str) -> set[str]:
     return {x for x in out if x}
 
 
+def _title_url_match_signals(title: str) -> list[str]:
+    """Words / slug from listing title to match against URL paths (detail pages often embed the name)."""
+    t = (title or "").strip().lower()
+    if len(t) < 4:
+        return []
+    parts = [p.strip("-_") for p in re.split(r"[^\w]+", t) if p.strip("-_")]
+    words = [p for p in parts if len(p) >= 5]
+    slug = "-".join(parts)
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in words:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    if len(slug) >= 8 and slug not in seen:
+        out.append(slug)
+    return out[:14]
+
+
 @router.post("/match-reference-urls")
 async def workbench_match_reference_urls(body: MatchReferenceUrlsBody):
     """
-    Find crawl URLs likely belonging to a selected property reference.
-    First checks URL text; then scans HTML content for the reference tokens.
+    Find crawl URLs likely belonging to a selected property.
+
+    - With `reference`: match URL text, then scan page HTML for the same token (and common variants).
+    - With `title_hint` (listing title): also match URL path segments and HTML text using title words /
+      slug, for sites that use SEO URLs without a numeric ref.
     """
     ref = (body.reference or "").strip()
+    title_hint = (body.title_hint or "").strip()
     urls = [u.strip() for u in (body.urls or []) if u and str(u).strip()]
-    if not ref or not urls:
+    if not urls or (not ref and not title_hint):
         return {"reference": ref, "matched": [], "scanned": 0}
 
     max_scan = min(len(urls), body.max_scan)
     urls = urls[:max_scan]
     variants = _ref_variants(ref)
+    title_signals = _title_url_match_signals(title_hint)
 
     sem = asyncio.Semaphore(body.concurrency)
 
     async def one(u: str) -> dict | None:
         ul = u.lower()
-        if any(v in ul for v in variants):
+        if variants and any(v in ul for v in variants):
             return {"url": u, "source": "url"}
+        if title_signals:
+            try:
+                pth = unquote(urlparse(u).path).lower()
+            except Exception:
+                pth = (urlparse(u).path or "").lower()
+            for sig in title_signals:
+                if len(sig) >= 6 and sig in pth:
+                    return {"url": u, "source": "title_url"}
+        if not variants and not title_signals:
+            return None
         async with sem:
             try:
                 r = await _engine_singleton.scrape(u)
@@ -838,15 +1045,25 @@ async def workbench_match_reference_urls(body: MatchReferenceUrlsBody):
             return None
         # Light normalization to catch variants in text/markup.
         h_compact = html.replace(" ", "").replace("-", "").replace("_", "")
-        for v in variants:
-            if v in html or v.replace(" ", "") in h_compact or v.replace("-", "") in h_compact:
-                return {"url": u, "source": "html"}
+        if variants:
+            for v in variants:
+                if v in html or v.replace(" ", "") in h_compact or v.replace("-", "") in h_compact:
+                    return {"url": u, "source": "html"}
+        if title_signals:
+            for sig in title_signals:
+                if len(sig) >= 6 and sig in html:
+                    return {"url": u, "source": "html_title"}
         return None
 
     rows = await asyncio.gather(*[one(u) for u in urls])
     matched = [r for r in rows if r]
     # Prefer direct URL matches first.
-    matched.sort(key=lambda x: 0 if (x or {}).get("source") == "url" else 1)
+    def _rank(m: dict) -> tuple[int, int]:
+        src = (m or {}).get("source") or ""
+        order = {"url": 0, "title_url": 1, "html": 2, "html_title": 3}
+        return (order.get(src, 9), 0)
+
+    matched.sort(key=_rank)
     matched = matched[: body.max_matches]
     return {"reference": ref, "matched": matched, "scanned": max_scan}
 
@@ -1081,947 +1298,3 @@ async def workbench_export_excel(body: ExportExcelBody):
         headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
     )
 
-
-# ---------------------------------------------------------------------------
-# Homes of Quality (HOQ) — dedicated listing + detail scraper
-# ---------------------------------------------------------------------------
-
-HOQ_DETAIL_BASE = "https://www.homesofquality.com.mt/listing-page/?reference="
-
-HOQ_LIST_PROMPT = """
-Extract EVERY property listing card from this HTML — the grid usually has ~10 listings per page.
-This is homesofquality.com.mt (Homes of Quality). Do not skip cards; do not duplicate the same reference.
-
-For each distinct property card, one JSON object with these keys (use null when unknown):
-- reference: string exactly as on site — formats include "90-9269064", "HQ927191", "SL926935", "30-200693" (from "Ref:" / "REF:" labels)
-- title: string
-- property_type: e.g. Apartment, Villa
-- status: e.g. On Market, Sold
-- category: sale or rent (lowercase)
-- price: number only
-- currency: e.g. EUR
-- bedrooms: int
-- bathrooms: int
-- internal_sqm: number or null
-- locality: string
-- description_preview: short snippet or null
-- main_image_url: absolute https URL for the main/cover photo (from img src, srcset largest, or data-src)
-- all_images: array of absolute image URLs if visible
-- listing_url: must be https://www.homesofquality.com.mt/listing-page/?reference={reference}
-  URL-encode the reference if it contains special characters.
-- badge: e.g. SOLE AGENCY, NEW, or null
-
-Return ONLY a JSON array. One row per unique reference. No markdown.
-"""
-
-
-HOQ_DETAIL_PROMPT = """
-Extract complete property details from this individual property page on homesofquality.com.mt
-
-The HTML may already include the FULL property description (any "Show full description" section has been expanded server-side).
-Copy the ENTIRE description text — do not summarize or truncate.
-
-Look in contact/agent/footer areas for listing agent details (name next to photo or heading, phone, email).
-
-total_sqm must be the TOTAL built/living area from the specifications section (labeled Total / Total area — often internal + external). Do not set total_sqm equal to internal_sqm unless the page only shows one combined figure.
-
-From the specifications / details tables (or bullet lists), extract room counts or labels and dimensions where shown: air conditioning, balconies, kitchen (description or type), living room, dining room, floor number, heating, lift, swimming pool, and per-room sizes.
-
-For EACH of these keys, use a JSON array of strings (never a single merged paragraph): one array element per distinct room row on the page that has a size — bedroom_dimensions, kitchen_dimensions, living_room_dimensions, dining_room_dimensions. Examples of labels to preserve as separate entries: Main bedroom, Bedroom 1/2/3, Kitchen, Kitchen/breakfast, Open-plan kitchen, Living room, Sitting room, Dining room, Dining area. Scan the whole specs section row-by-row; do not skip rooms because there are several of the same category (e.g. three bedrooms with three areas → three strings). If only one room of that type has a size, use a one-element array. If that room type has no sizes on the page, use null.
-
-Extract EVERY piece of information visible. Return ONE flat JSON object:
-{
-  "reference": "REF number",
-  "title": "full property title",
-  "property_type": "Apartment/Villa/etc",
-  "status": "On Market/Sold/etc",
-  "badge": "SOLE AGENCY/NEW/etc",
-  "category": "sale/rent",
-  "price": 540000,
-  "currency": "EUR",
-  "price_text": "€540,000",
-  "bedrooms": 2,
-  "bathrooms": 2,
-  "internal_sqm": 150,
-  "external_sqm": 50,
-  "total_sqm": 200,
-  "floor_level": "4th floor",
-  "floor_number": "4",
-  "furnished": "furnished/unfurnished",
-  "locality": "",
-  "town": "",
-  "region": "Malta",
-  "full_address": "",
-  "latitude": null,
-  "longitude": null,
-  "description": "COMPLETE full description text from About This Home / body (not a preview)",
-  "air_conditioning": null,
-  "balconies": null,
-  "kitchen": null,
-  "living_room": null,
-  "dining_room": null,
-  "heating": null,
-  "lift": null,
-  "swimming_pool": null,
-  "dining_room_dimensions": null,
-  "living_room_dimensions": null,
-  "kitchen_dimensions": null,
-  "bedroom_dimensions": null,
-  "features": ["..."],
-  "amenities": ["..."],
-  "all_images": ["full url1"],
-  "floor_plan_url": null,
-  "virtual_tour_url": null,
-  "agent_name": null,
-  "agent_phone": null,
-  "agent_email": null,
-  "listing_date": null,
-  "listing_url": "full URL of this page"
-}
-
-Extract ALL images from carousel/gallery — full absolute URLs only.
-Return ONLY valid JSON. No markdown.
-"""
-
-
-class HoqListBody(BaseModel):
-    url: str = "https://www.homesofquality.com.mt/latest-properties/"
-    page: int = 1
-    # Consecutive listing pages to fetch (merged, deduped by reference). Max 100 per request.
-    page_count: int = Field(1, ge=1, le=100)
-
-
-class HoqDetailBody(BaseModel):
-    references: list[str] = Field(default_factory=list)
-
-
-def _hoq_build_list_url(url: str, page: int) -> str:
-    """HOQ pagination: page 1 = canonical URL (no listings_page). Page 2+ = ?listings_page=N&sort="""
-    u = url.strip()
-    if not u.startswith(("http://", "https://")):
-        u = "https://" + u.lstrip("/")
-    parsed = urlparse(u)
-    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    pg = max(1, int(page))
-
-    if pg <= 1:
-        # First grid matches https://www.homesofquality.com.mt/latest-properties/ — no listings_page param.
-        q.pop("listings_page", None)
-        new_query = urlencode(sorted(q.items())) if q else ""
-        return urlunparse(parsed._replace(query=new_query))
-
-    q["listings_page"] = str(pg)
-    if "sort" not in q:
-        q["sort"] = ""
-    new_query = urlencode(sorted(q.items()))
-    return urlunparse(parsed._replace(query=new_query))
-
-
-def _hoq_abs_media_url(u: str | None) -> str | None:
-    if not u or not isinstance(u, str):
-        return None
-    u = u.strip().strip('"').strip("'")
-    if not u or u.startswith("data:"):
-        return None
-    if u.startswith("//"):
-        return "https:" + u
-    if u.startswith("/"):
-        return urljoin("https://www.homesofquality.com.mt/", u)
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    return urljoin("https://www.homesofquality.com.mt/", "/" + u.lstrip("/"))
-
-
-def _hoq_normalize_reference(raw: object) -> str | None:
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    m = re.search(r"REF(?:ERENCE)?[:\s#]*([A-Za-z0-9\-]+)", s, re.I)
-    if m:
-        return m.group(1).strip()
-    if re.fullmatch(r"[A-Za-z0-9\-]+", s):
-        return s
-    m2 = re.search(r"([A-Za-z]{0,6}\d[\w\-]*)", s)
-    return m2.group(1).strip() if m2 else None
-
-
-def _hoq_normalize_list_item(item: dict) -> dict:
-    ref = _hoq_normalize_reference(item.get("reference") or item.get("ref"))
-    if ref:
-        item["reference"] = ref
-        item["listing_url"] = f"{HOQ_DETAIL_BASE}{quote(ref, safe='')}"
-    mi = _hoq_abs_media_url(item.get("main_image_url") if isinstance(item.get("main_image_url"), str) else None)
-    imgs_raw = item.get("all_images")
-    fixed_imgs: list[str] = []
-    if isinstance(imgs_raw, list):
-        for x in imgs_raw:
-            if not isinstance(x, str):
-                continue
-            for part in re.split(r"[,\s]+", x):
-                abs_u = _hoq_abs_media_url(part.strip())
-                if abs_u and abs_u not in fixed_imgs:
-                    fixed_imgs.append(abs_u)
-    item["all_images"] = fixed_imgs
-    if not mi and fixed_imgs:
-        mi = fixed_imgs[0]
-    item["main_image_url"] = mi
-    return item
-
-
-def _hoq_dedupe_rows(rows: list[dict]) -> list[dict]:
-    """Drop duplicate references only; keep rows even if reference missing (LLM sometimes omits format)."""
-    seen: set[str] = set()
-    out: list[dict] = []
-    for r in rows:
-        ref = r.get("reference")
-        if isinstance(ref, str) and ref.strip():
-            if ref in seen:
-                continue
-            seen.add(ref)
-        out.append(r)
-    return out
-
-
-def _hoq_parse_total_pages(html: str) -> int | None:
-    h = html.replace("&amp;", "&")
-    nums = [int(x) for x in re.findall(r"listings_page=(\d+)", h, flags=re.I)]
-    if nums:
-        return max(nums)
-    m = re.search(r"\.\.\.\s*(\d{1,4})\s*Next", html, flags=re.I)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            pass
-    return None
-
-
-def _hoq_html_for_llm(html: str, max_chars: int = 160_000) -> str:
-    """Strip chrome and scripts so the model sees listing cards, not only the first 20k chars of <head>."""
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    main_el = (
-        soup.select_one("main")
-        or soup.select_one("#primary")
-        or soup.select_one(".site-main")
-        or soup.select_one("[class*='listing']")
-        or soup.body
-    )
-    blob = str(main_el or soup)
-    if len(blob) < 6000 and soup.body:
-        blob = str(soup.body)[:max_chars]
-    return blob[:max_chars]
-
-
-def _hoq_detect_has_next_page(html: str, page: int, total_pages: int | None) -> bool:
-    if total_pages is not None:
-        return page < total_pages
-    h = html.replace("&amp;", "&")
-    nxt = page + 1
-    if re.search(rf"listings_page={nxt}[\"&\s<>]", h):
-        return True
-    if re.search(rf"/page/{nxt}/", h):
-        return True
-    soup = BeautifulSoup(html, "html.parser")
-    if soup.select_one('a[rel="next"]'):
-        return True
-    for a in soup.find_all("a", href=True):
-        href = str(a.get("href") or "")
-        if f"listings_page={nxt}" in href or f"/page/{nxt}" in href or f"paged={nxt}" in href:
-            return True
-        t = (a.get_text() or "").strip().lower()
-        if t in ("next", "›", "»") and ("page" in href.lower() or "paged" in href.lower() or "listings_page" in href):
-            return True
-    return False
-
-
-async def _hoq_try_expand_description(page: object) -> bool:
-    """Reveal full listing copy on HOQ pages (truncated until 'Show full description' is clicked)."""
-    clicked = False
-    try:
-        ab = page.locator("text=/About This Home/i").first
-        if await ab.count() > 0:
-            await ab.scroll_into_view_if_needed(timeout=8000)
-            await page.wait_for_timeout(450)
-    except Exception:
-        logger.debug("HOQ: scroll to About This Home skipped")
-
-    try:
-        await page.click("text=/Show full description/i", timeout=12_000)
-        await page.wait_for_timeout(2200)
-        clicked = True
-    except Exception:
-        pass
-
-    patterns = (
-        re.compile(r"show\s+full\s+description", re.I),
-        re.compile(r"read\s+full\s+description", re.I),
-    )
-    if not clicked:
-        for pat in patterns:
-            try:
-                loc = page.get_by_text(pat).first
-                await loc.wait_for(state="visible", timeout=8000)
-                await loc.scroll_into_view_if_needed(timeout=6000)
-                await loc.click(timeout=10_000)
-                await page.wait_for_timeout(2200)
-                clicked = True
-                break
-            except Exception:
-                continue
-    if not clicked:
-        try:
-            btn = page.get_by_role("button", name=re.compile(r"full\s+description", re.I))
-            if await btn.count() > 0:
-                b = btn.first
-                await b.scroll_into_view_if_needed(timeout=6000)
-                await b.click(timeout=10_000)
-                await page.wait_for_timeout(2200)
-                clicked = True
-        except Exception:
-            pass
-    if not clicked:
-        try:
-            link = page.get_by_role("link", name=re.compile(r"full\s+description", re.I))
-            if await link.count() > 0:
-                lk = link.first
-                await lk.scroll_into_view_if_needed(timeout=6000)
-                await lk.click(timeout=10_000)
-                await page.wait_for_timeout(2200)
-                clicked = True
-        except Exception:
-            pass
-    if not clicked:
-        try:
-            did = await page.evaluate(
-                """() => {
-                  const cand = Array.from(
-                    document.querySelectorAll("a,button,[role='button'],span,div,p")
-                  );
-                  for (const el of cand) {
-                    const t = (el.innerText || el.textContent || "").trim();
-                    if (/show\\s+full\\s+description/i.test(t) && t.length < 100) {
-                      el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-                      return true;
-                    }
-                  }
-                  return false;
-                }"""
-            )
-            if did:
-                await page.wait_for_timeout(2200)
-                clicked = True
-        except Exception:
-            logger.debug("HOQ: JS click Show full description failed")
-    return clicked
-
-
-def _hoq_extract_full_description_from_html(html: str) -> str | None:
-    """Pull the expanded property body copy from HOQ HTML (About This Home / paragraphs near the toggle)."""
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("main") or soup.body
-    if not root:
-        return None
-
-    best = ""
-    for h in root.find_all(["h2", "h3", "h4"]):
-        ht = (h.get_text() or "").strip()
-        if not re.search(r"about\s+this\s+home", ht, re.I):
-            continue
-        blob_parts: list[str] = []
-        cur = h
-        for _ in range(35):
-            nxt = cur.next_sibling
-            while nxt is not None and not getattr(nxt, "name", None):
-                nxt = nxt.next_sibling
-            if nxt is None:
-                break
-            nm = (nxt.name or "").lower()
-            if nm in ("h1", "h2", "h3", "h4"):
-                break
-            t = " ".join(nxt.get_text(" ", strip=True).split())
-            if len(t) > 35:
-                blob_parts.append(t)
-            cur = nxt
-        joined = "\n\n".join(blob_parts)
-        if len(joined) > len(best):
-            best = joined
-
-    toggle_rx = re.compile(r"(show|hide)\s+full\s+description", re.I)
-    for el in root.find_all(["a", "button", "span", "div"]):
-        tx = (el.get_text() or "").strip()
-        if not tx or len(tx) > 140:
-            continue
-        if not toggle_rx.search(tx):
-            continue
-        cur = el
-        for _ in range(14):
-            if cur is None:
-                break
-            paras: list[str] = []
-            for p in cur.find_all("p"):
-                t = " ".join((p.get_text() or "").split())
-                if len(t) > 30:
-                    paras.append(t)
-            joined = "\n\n".join(paras)
-            if len(joined) > len(best):
-                best = joined
-            cur = getattr(cur, "parent", None)
-
-    if len(best) < 180:
-        for h in root.find_all(["h2", "h3", "h4", "div", "span"]):
-            ht = (h.get_text() or "").strip()
-            if not re.search(r"about\s+this\s+home", ht, re.I):
-                continue
-            sec = h.find_parent(["section", "article", "div"]) or h.parent
-            if not sec:
-                continue
-            paras = []
-            for p in sec.find_all("p"):
-                t = " ".join((p.get_text() or "").split())
-                if len(t) > 30:
-                    paras.append(t)
-            blob = "\n\n".join(paras)
-            if len(blob) > len(best):
-                best = blob
-
-    out = best.strip()
-    return out if len(out) > 60 else None
-
-
-def _hoq_parse_sqm_token(raw: str) -> float | None:
-    if not raw or not str(raw).strip():
-        return None
-    s = str(raw).strip().replace(" ", "").replace("\xa0", "")
-    if not s:
-        return None
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and s.rfind(",") > len(s) - 4:
-        s = s.replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", "")
-    try:
-        v = float(s)
-        if 8.0 <= v <= 80000.0:
-            return v
-    except ValueError:
-        pass
-    return None
-
-
-def _hoq_extract_total_sqm_from_html(html: str) -> float | None:
-    """Read total floor area (m²) from HOQ listing-page HTML — specs table / labels, not LLM."""
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("main") or soup.body
-    if not root:
-        return None
-    blob = root.get_text("\n", strip=True)
-
-    for dt in root.find_all("dt"):
-        lab = (dt.get_text() or "").strip().lower()
-        if "total" not in lab:
-            continue
-        if "internal" in lab and "total" not in lab:
-            continue
-        dd = dt.find_next_sibling("dd")
-        if dd:
-            m = re.search(r"([\d][\d.,]*)", dd.get_text() or "")
-            if m:
-                v = _hoq_parse_sqm_token(m.group(1))
-                if v:
-                    return v
-
-    for rx in (
-        r"(?im)[^\n]{0,48}\btotal\s+area\b[^\n]{0,24}?([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sq\.?\s*m|sqm)?",
-        r"(?i)total\s+area\s*[:\-]?\s*([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sqm)?",
-        r"(?i)total\s+(?:m\s*)?(?:²|2)\s*[:\-]?\s*([\d][\d.,]*)",
-        r"(?i)total\s+(?:size|surface|floor\s*area)\s*[:\-]?\s*([\d][\d.,]*)",
-        r"(?i)\b([\d][\d.,]*)\s*m\s*(?:²|2)\s*(?:total|overall)\b",
-    ):
-        m = re.search(rx, blob)
-        if m:
-            v = _hoq_parse_sqm_token(m.group(1))
-            if v:
-                return v
-
-    for row in root.find_all(["tr", "div", "li"]):
-        t = " ".join((row.get_text() or "").split())
-        tl = t.lower()
-        if "total" not in tl:
-            continue
-        if "internal" in tl and "total" not in tl:
-            continue
-        if not any(x in tl for x in ("m²", "m2", "sqm", "sq m")):
-            continue
-        m = re.search(r"([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sqm|sq\.?\s*m)", t, re.I)
-        if m:
-            v = _hoq_parse_sqm_token(m.group(1))
-            if v:
-                return v
-
-    return None
-
-
-def _hoq_extract_internal_sqm_from_html(html: str) -> float | None:
-    """Internal / living area (m²) from HOQ listing-page HTML — specifications section."""
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("main") or soup.body
-    if not root:
-        return None
-    blob = root.get_text("\n", strip=True)
-
-    for dt in root.find_all("dt"):
-        lab = (dt.get_text() or "").strip().lower()
-        if "external" in lab and "internal" not in lab:
-            continue
-        if not any(k in lab for k in ("internal", "living", "interior")):
-            continue
-        if "total" in lab and "internal" not in lab:
-            continue
-        dd = dt.find_next_sibling("dd")
-        if dd:
-            m = re.search(r"([\d][\d.,]*)", dd.get_text() or "")
-            if m:
-                v = _hoq_parse_sqm_token(m.group(1))
-                if v:
-                    return v
-
-    for rx in (
-        r"(?i)internal\s+area\s*[:\-]?\s*([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sqm)?",
-        r"(?i)internal\s+(?:m\s*)?(?:²|2)\s*[:\-]?\s*([\d][\d.,]*)",
-        r"(?i)living\s+(?:area|space)?\s*[:\-]?\s*([\d][\d.,]*)",
-        r"(?i)\bliving\s+area\s*[:\-]?\s*([\d][\d.,]*)",
-        r"(?im)[^\n]{0,52}\binternal\s+area\b[^\n]{0,28}?([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sq\.?\s*m|sqm)?",
-    ):
-        m = re.search(rx, blob)
-        if m:
-            v = _hoq_parse_sqm_token(m.group(1))
-            if v:
-                return v
-
-    for row in root.find_all(["tr", "div", "li"]):
-        t = " ".join((row.get_text() or "").split())
-        tl = t.lower()
-        if not any(k in tl for k in ("internal", "living")):
-            continue
-        if "external" in tl and "internal" not in tl:
-            continue
-        if not any(x in tl for x in ("m²", "m2", "sqm", "sq m")):
-            continue
-        if "total" in tl and "internal" not in tl:
-            continue
-        m = re.search(r"([\d][\d.,]*)\s*(?:m\s*(?:²|2)|sqm|sq\.?\s*m)", t, re.I)
-        if m:
-            v = _hoq_parse_sqm_token(m.group(1))
-            if v:
-                return v
-
-    return None
-
-
-def _hoq_supplement_detail_from_html(html: str, data: dict) -> None:
-    """Fill agent_email / agent_phone / agent_name from DOM when the LLM skipped them."""
-    soup = BeautifulSoup(html, "html.parser")
-    root = soup.select_one("main") or soup.body
-    if not root:
-        return
-    blob = root.get_text("\n", strip=True)
-
-    if not data.get("agent_email"):
-        for a in root.select('a[href^="mailto:"]'):
-            href = (a.get("href") or "").strip()
-            em = href.replace("mailto:", "").split("?")[0].strip()
-            if "@" in em and "." in em.split("@", 1)[-1]:
-                data["agent_email"] = em
-                break
-
-    if not data.get("agent_phone"):
-        for a in root.select('a[href^="tel:"]'):
-            href = (a.get("href") or "").strip()
-            ph = href.replace("tel:", "").split("?")[0].strip()
-            digits = re.sub(r"\D", "", ph)
-            if len(digits) >= 7:
-                data["agent_phone"] = ph
-                break
-
-    if not data.get("agent_name"):
-        m = re.search(r"(?:listing\s+)?agent\s*[:\-]\s*([^\n\r]{3,90})", blob, re.I)
-        if m:
-            data["agent_name"] = m.group(1).strip()
-
-    if not data.get("agent_name"):
-        for a in root.select('a[href^="mailto:"]'):
-            card = a.find_parent(["div", "section", "article", "li"])
-            if not card:
-                continue
-            for tag in card.find_all(["h2", "h3", "h4", "strong"]):
-                t = (tag.get_text() or "").strip()
-                if 4 <= len(t) <= 90 and re.search(r"[A-Za-zÀ-ž]{2,}", t):
-                    low = t.lower()
-                    if not any(x in low for x in ("description", "about this", "property", "contact us")):
-                        data["agent_name"] = t.split("\n")[0].strip()
-                        return
-
-
-async def _hoq_playwright_html(
-    url: str,
-    *,
-    scroll: bool,
-    wait_images: bool,
-    detail_expand_description: bool = False,
-    detail_capture: dict | None = None,
-) -> tuple[str | None, str | None]:
-    try:
-        from playwright.async_api import async_playwright
-        from playwright_stealth import stealth_async
-    except ImportError as exc:
-        return None, f"Playwright not available: {exc}"
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            page = await browser.new_page()
-            await stealth_async(page)
-            # `networkidle` often never fires (analytics, websockets, long-polling) → 30s timeout.
-            # DOM + brief settle + scroll is enough to capture listing HTML.
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            try:
-                await page.wait_for_load_state("load", timeout=15_000)
-            except Exception:
-                logger.debug("HOQ: load event wait skipped or timed out")
-            await page.wait_for_timeout(2500)
-            try:
-                await page.locator("text=/Ref:/i").first.wait_for(timeout=18_000)
-            except Exception:
-                logger.debug("HOQ: Ref marker wait skipped (page may differ)")
-            await page.wait_for_timeout(1200)
-            if detail_expand_description:
-                try:
-                    await page.evaluate("window.scrollBy(0, 550)")
-                    await page.wait_for_timeout(500)
-                except Exception:
-                    logger.debug("HOQ detail: pre-expand scroll skipped")
-                await _hoq_try_expand_description(page)
-            if wait_images:
-                try:
-                    await page.wait_for_selector("img[src]", timeout=8000)
-                except Exception:
-                    logger.debug("HOQ: img selector wait skipped")
-            if scroll:
-                await page.evaluate(
-                    """async () => {
-                      for (let i = 0; i < 10; i++) {
-                        window.scrollBy(0, 900);
-                        await new Promise(r => setTimeout(r, 450));
-                      }
-                    }"""
-                )
-            if detail_expand_description:
-                await _hoq_try_expand_description(page)
-            if detail_expand_description and detail_capture is not None:
-                try:
-                    await page.wait_for_timeout(500)
-                    live = await page.evaluate(_HOQ_LIVE_ABOUT_DESC_JS)
-                    if isinstance(live, str) and len(live.strip()) >= 80:
-                        detail_capture["about_home_description"] = live.strip()
-                except Exception:
-                    logger.debug("HOQ: live About This Home text evaluate failed", exc_info=True)
-            html = await page.content()
-            return html, None
-        except Exception as exc:
-            logger.exception("HOQ Playwright failed for %s", url)
-            return None, str(exc)
-        finally:
-            await browser.close()
-
-
-async def scrape_hoq_listing_page(url: str, page: int = 1) -> tuple[list[dict], bool, str | None, int | None]:
-    list_url = _hoq_build_list_url(url, page)
-    html, err = await _hoq_playwright_html(list_url, scroll=True, wait_images=True)
-    if err or not html:
-        return [], False, err or "Empty HTML", None
-
-    if not settings.openai_api_key:
-        return [], False, "OPENAI_API_KEY is not configured", None
-
-    total_pages = _hoq_parse_total_pages(html)
-    html_in = _hoq_html_for_llm(html)
-    try:
-        raw = await call_openai(HOQ_LIST_PROMPT, html_in, max_tokens=12_000)
-    except Exception as exc:
-        logger.exception("HOQ list OpenAI failed")
-        return [], False, str(exc), total_pages
-
-    parsed = parse_json_universal(raw)
-    rows: list[dict] = []
-    if isinstance(parsed, list):
-        rows = [x for x in parsed if isinstance(x, dict)]
-    elif isinstance(parsed, dict):
-        inner = parsed.get("properties") or parsed.get("listings") or parsed.get("items")
-        if isinstance(inner, list):
-            rows = [x for x in inner if isinstance(x, dict)]
-
-    normalized = [_hoq_normalize_list_item(dict(r)) for r in rows]
-    normalized = _hoq_dedupe_rows(normalized)
-    has_more = _hoq_detect_has_next_page(html, page, total_pages)
-    return normalized, has_more, None, total_pages
-
-
-def _hoq_normalize_dimension_field(data: dict, plural_key: str, singular_key: str) -> None:
-    """Coerce a room-dimension field to list[str]; merge legacy singular key."""
-    raw = data.get(plural_key)
-    legacy = data.pop(singular_key, None)
-
-    lines: list[str] = []
-
-    def _consume(val: object) -> None:
-        if val is None:
-            return
-        if isinstance(val, list):
-            for x in val:
-                if x is None:
-                    continue
-                s = str(x).strip()
-                if s:
-                    lines.append(s)
-            return
-        if isinstance(val, dict):
-            for k, v in val.items():
-                vs = str(v).strip() if v is not None else ""
-                if vs:
-                    lines.append(f"{str(k).strip()}: {vs}")
-            return
-        s = str(val).strip()
-        if not s:
-            return
-        if "\n" in s or "\r" in s:
-            for ln in re.split(r"[\n\r]+", s):
-                t = ln.strip()
-                if t:
-                    lines.append(t)
-            return
-        lines.append(s)
-
-    _consume(raw)
-    if not lines:
-        _consume(legacy)
-
-    # Model sometimes merges multiple rooms into one string; split on ; or |
-    if len(lines) == 1 and lines[0] and re.search(r"[;|]", lines[0]):
-        parts = [p.strip() for p in re.split(r"\s*[;|]\s*", lines[0]) if p.strip()]
-        if len(parts) > 1:
-            lines = parts
-
-    if lines:
-        data[plural_key] = lines
-    else:
-        data.pop(plural_key, None)
-
-
-def _hoq_normalize_all_room_dimensions(data: dict) -> None:
-    for plural, singular in (
-        ("bedroom_dimensions", "bedroom_dimension"),
-        ("kitchen_dimensions", "kitchen_dimension"),
-        ("living_room_dimensions", "living_room_dimension"),
-        ("dining_room_dimensions", "dining_room_dimension"),
-    ):
-        _hoq_normalize_dimension_field(data, plural, singular)
-
-
-async def scrape_hoq_detail(reference_or_url: str) -> tuple[dict | None, str | None]:
-    s = reference_or_url.strip()
-    if s.startswith("http"):
-        detail_url = s
-        ref_key = None
-        for part in urlparse(s).query.split("&"):
-            if part.startswith("reference="):
-                ref_key = _hoq_normalize_reference(unquote(part.split("=", 1)[1]))
-                break
-        if ref_key is None:
-            ref_key = _hoq_normalize_reference(s)
-    else:
-        ref_n = _hoq_normalize_reference(s)
-        if not ref_n:
-            return None, "Invalid reference"
-        detail_url = f"{HOQ_DETAIL_BASE}{quote(ref_n, safe='')}"
-        ref_key = ref_n
-
-    _detail_cap: dict[str, str] = {}
-    html, err = await _hoq_playwright_html(
-        detail_url,
-        scroll=True,
-        wait_images=True,
-        detail_expand_description=True,
-        detail_capture=_detail_cap,
-    )
-    if err or not html:
-        return None, err or "Empty HTML"
-
-    if not settings.openai_api_key:
-        return None, "OPENAI_API_KEY is not configured"
-
-    html_for_model = _hoq_html_for_llm(html, max_chars=160_000)
-
-    try:
-        raw = await call_openai(HOQ_DETAIL_PROMPT, html_for_model, max_tokens=12000)
-    except Exception as exc:
-        return None, str(exc)
-
-    data = parse_json_safely(raw)
-    if not data:
-        return None, "LLM returned empty or invalid JSON"
-
-    ag = data.get("agent")
-    if isinstance(ag, dict):
-        data.pop("agent", None)
-        if not data.get("agent_name"):
-            data["agent_name"] = ag.get("name") or ag.get("full_name")
-        if not data.get("agent_email"):
-            data["agent_email"] = ag.get("email")
-        if not data.get("agent_phone"):
-            data["agent_phone"] = ag.get("phone") or ag.get("mobile") or ag.get("tel")
-
-    _hoq_normalize_all_room_dimensions(data)
-
-    _hoq_supplement_detail_from_html(html, data)
-
-    live_about = _detail_cap.get("about_home_description")
-    if isinstance(live_about, str) and len(live_about.strip()) >= 80:
-        data["description"] = _hoq_normalize_about_description(live_about)
-    else:
-        dom_desc = _hoq_extract_full_description_from_html(html)
-        if dom_desc:
-            data["description"] = _hoq_normalize_about_description(dom_desc)
-
-    dom_total = _hoq_extract_total_sqm_from_html(html)
-    if dom_total is not None:
-        data["total_sqm"] = dom_total
-
-    dom_int = _hoq_extract_internal_sqm_from_html(html)
-    if dom_int is not None:
-        data["internal_sqm"] = dom_int
-
-    data["listing_url"] = detail_url
-    if ref_key:
-        data.setdefault("reference", ref_key)
-    imgs = data.get("all_images")
-    if isinstance(imgs, list):
-        fixed: list[str] = []
-        for x in imgs:
-            if not isinstance(x, str):
-                continue
-            u = _hoq_abs_media_url(x)
-            if u:
-                fixed.append(u)
-        data["all_images"] = fixed
-    mi = data.get("main_image_url")
-    if isinstance(mi, str):
-        data["main_image_url"] = _hoq_abs_media_url(mi)
-
-    return data, None
-
-
-@router.get("/hoq/ping")
-async def hoq_ping():
-    """Sanity check — if this 404s, the API process needs a restart (HOQ routes not loaded)."""
-    return {"ok": True, "module": "workbench.hoq"}
-
-
-@router.post("/hoq/scrape-list")
-async def hoq_scrape_list(body: HoqListBody):
-    start = max(1, int(body.page or 1))
-    n_pages = max(1, min(100, int(body.page_count or 1)))
-    merged: list[dict] = []
-    seen: set[str] = set()
-    last_err: str | None = None
-    total_pages_hint: int | None = None
-    last_url = _hoq_build_list_url(body.url, start)
-    last_has_more = False
-    last_fetched = start - 1
-
-    for i in range(n_pages):
-        p = start + i
-        props, page_has_more, err, tp = await scrape_hoq_listing_page(body.url, p)
-        last_url = _hoq_build_list_url(body.url, p)
-        last_fetched = p
-        if tp is not None:
-            total_pages_hint = tp
-        if err:
-            last_err = err
-            break
-        last_has_more = page_has_more
-        for row in props:
-            ref = row.get("reference")
-            if not ref or not isinstance(ref, str) or ref in seen:
-                continue
-            seen.add(ref)
-            merged.append(row)
-        if i < n_pages - 1:
-            await asyncio.sleep(0.8)
-
-    if total_pages_hint is not None:
-        global_has_more = last_fetched < total_pages_hint
-    else:
-        global_has_more = last_has_more
-
-    out: dict = {
-        "properties": merged,
-        "has_more": bool(global_has_more),
-        "page": start,
-        "page_count": n_pages,
-        "pages_fetched": max(0, last_fetched - start + 1) if last_err is None else 0,
-        "total_pages": total_pages_hint,
-        "url_used": last_url,
-    }
-    if last_err:
-        out["error"] = last_err
-    return out
-
-
-@router.post("/hoq/scrape-detail")
-async def hoq_scrape_detail(body: HoqDetailBody):
-    refs = [str(r).strip() for r in body.references if r and str(r).strip()]
-    if not refs:
-        return {"results": [], "total": 0}
-
-    results: list[dict] = []
-    for i, ref in enumerate(refs):
-        if i > 0:
-            await asyncio.sleep(2)
-        try:
-            data, err = await scrape_hoq_detail(ref)
-            if err:
-                results.append(
-                    {
-                        "reference": ref,
-                        "success": False,
-                        "error": err,
-                        "data": None,
-                    }
-                )
-            elif data:
-                results.append(
-                    {
-                        "reference": data.get("reference") or ref,
-                        "success": True,
-                        "error": None,
-                        "data": data,
-                    }
-                )
-            else:
-                results.append(
-                    {
-                        "reference": ref,
-                        "success": False,
-                        "error": "Empty extraction",
-                        "data": None,
-                    }
-                )
-        except Exception as exc:
-            logger.exception("HOQ detail failed for %s", ref)
-            results.append({"reference": ref, "success": False, "error": str(exc), "data": None})
-
-    ok = sum(1 for r in results if r.get("success"))
-    return {"results": results, "total": ok}
