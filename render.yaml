@@ -8,7 +8,7 @@ services:
     # Install deps + Chromium browser (for Playwright/Stagehand LOCAL mode — FREE, no Browserbase needed)
     buildCommand: npm install && npx playwright install chromium --with-deps && npm run build
     startCommand: npm run start
-    plan: starter           # $7/mo — no cold starts, always-on
+    plan: free              # Free tier — spins down after 15min inactivity
     healthCheckPath: /
     envVars:
       # LOCAL mode — uses Playwright on Render's Linux server (FREE, no Browserbase)
@@ -32,7 +32,7 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    plan: starter           # $7/mo — no cold starts, always-on
+    plan: free              # Free tier — spins down after 15min inactivity
     healthCheckPath: /health
     envVars:
       # OpenAI — ARIA agent uses this
