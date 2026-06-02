@@ -28,7 +28,7 @@
 
 | Feature | Description |
 |---|---|
-| 🌐 **Live Web Browsing** | Discovers top local agencies via Apify, visits them with Stagehand + Browserbase |
+| 🌐 **Live Web Browsing** | Discovers agencies via Apify (primary) or Tavily (fallback), visits them with Stagehand + Playwright |
 | 🏡 **Any City, Any Country** | Malta, Dubai, London, Karachi, New York — anywhere in the world |
 | 🔗 **Paste Any URL** | Share any real estate website → ARIA visits it and extracts listings |
 | 📈 **Investment Calculator** | ROI, gross/net yield, cap rate, monthly cashflow, payback period — pure math |
@@ -67,7 +67,7 @@
 │  │  ARIA's Tools (9 tools):                                 │    │
 │  │    🏢 find_agencies        → Apify Google Search         │    │
 │  │    🌐 live_search_properties → find + scrape pipeline    │    │
-│  │    🔗 scrape_website       → Stagehand (Browserbase)     │    │
+│  │    🔗 scrape_website       → Stagehand (Playwright LOCAL) │    │
 │  │    🏠 get_property_details → Stagehand detail page       │    │
 │  │    🔎 web_search           → Tavily / DuckDuckGo         │    │
 │  │    📊 compare_properties   → GPT-4o-mini analysis        │    │
@@ -85,7 +85,7 @@
 │  Supabase   │    │         Next.js API Routes                  │
 │  Postgres   │    │  /api/stagehand/search  → live search      │
 │  + pgvector │    │  /api/stagehand/scrape-url → scrape URL    │
-│             │    │  Stagehand v3 + Browserbase cloud browsers │
+│             │    │  Stagehand v3 + Playwright (LOCAL mode)    │
 │  • threads  │    └────────────────────────────────────────────┘
 │  • messages │
 │  • user     │
@@ -130,12 +130,12 @@ Every 20 turns: scan for recurring issues → auto-patch system prompt
 | **Frontend** | Next.js 14 (App Router), TypeScript, Tailwind CSS |
 | **Backend** | FastAPI (Python 3.11), fully async |
 | **AI Agent** | OpenAI Agents SDK v0.17, GPT-4o / GPT-4o-mini |
-| **Live Scraping** | Stagehand v3 + Browserbase (cloud Chromium) |
-| **Agency Discovery** | Apify (Google Search actor) |
-| **Web Search** | Tavily API / DuckDuckGo fallback |
+| **Live Scraping** | Stagehand v3 + Playwright (LOCAL mode — no Browserbase needed) |
+| **Agency Discovery** | Apify Google Search Scraper (PRIMARY) → Tavily fallback |
+| **Web Search** | Tavily API (fallback) → DuckDuckGo fallback |
 | **Database** | Supabase Postgres + pgvector (1536-dim embeddings) |
 | **PDF Export** | WeasyPrint + Jinja2 |
-| **Deployment** | Vercel (frontend) + Render (backend) |
+| **Deployment** | Google Cloud Platform — e2-micro VM (forever free) |
 
 ---
 
@@ -144,10 +144,11 @@ Every 20 turns: scan for recurring issues → auto-patch system prompt
 ### Prerequisites
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 20+
 - OpenAI API key
-- Browserbase account (free tier available)
+- Apify account (free tier — for agency discovery)
 - Supabase project (free tier)
+- Tavily API key (free tier — fallback web search)
 
 ### 1. Clone & install
 
@@ -175,30 +176,32 @@ OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini          # or gpt-4o for best quality
 
 # Supabase
-DATABASE_URL=postgresql+asyncpg://postgres:password@db.xxx.supabase.co:5432/postgres
+DATABASE_URL=postgresql://postgres:[password]@[host]:5432/postgres
 SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_KEY=your-anon-key
 
-# Browserbase (cloud browsers for Stagehand)
-BROWSERBASE_API_KEY=bb_...
-BROWSERBASE_PROJECT_ID=proj_...
+# Apify — Agency Discovery (PRIMARY)
+# Get from: https://console.apify.com → Settings → API & Integrations
+APIFY_API_KEY=apify_api_...
 
-# Apify (agency discovery via Google Search)
-APIFY_API_KEY=apify_...
-
-# Tavily (web search)
+# Tavily — Web Search (FALLBACK for agency discovery + general search)
+# Get from: https://tavily.com (free tier: 1000 searches/mo)
 TAVILY_API_KEY=tvly-...
 
 # Frontend URL (where Next.js Stagehand routes live)
 FRONTEND_URL=http://localhost:3000
+
+# ARIA Config
+USE_ARIA_AGENT=true
+ARIA_MAX_TOOL_ROUNDS=10
 ```
 
 **`frontend/.env.local`**
 ```env
+STAGEHAND_ENV=LOCAL              # Uses Playwright locally — no Browserbase needed
 OPENAI_API_KEY=sk-...
-BROWSERBASE_API_KEY=bb_...
-BROWSERBASE_PROJECT_ID=proj_...
 NEXT_PUBLIC_API_URL=http://localhost:8000
+BACKEND_PROXY_URL=http://localhost:8000
 ```
 
 ### 3. Set up the database
@@ -406,16 +409,35 @@ python -m pytest ../tests/test_aria_agent.py -v
 
 ## 🚢 Deployment
 
-### Frontend → Vercel
+### Google Cloud Platform (Free Forever)
+
+Both frontend and backend deploy on a single **GCP e2-micro VM** (1GB RAM, forever free in us-central1).
+
+**Why GCP e2-micro?**
+- ✅ Forever free (not just 12 months)
+- ✅ 1GB RAM — Playwright/Chromium runs comfortably
+- ✅ Persistent server — no cold starts, no timeouts
+- ✅ `STAGEHAND_ENV=LOCAL` — no Browserbase needed
 
 ```bash
-cd frontend && vercel --prod
+# On the VM after SSH:
+git clone https://github.com/DoniaBatool/Real-Estate-Scraper-Agent.git
+cd Real-Estate-Scraper-Agent
+
+# Backend
+cd backend && python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+# Create .env with your keys
+pm2 start "uvicorn main:app --host 0.0.0.0 --port 8000" --name aria-backend
+
+# Frontend
+cd ../frontend && npm install
+npx playwright install chromium --with-deps
+npm run build
+pm2 start "npm run start" --name aria-frontend
 ```
 
-### Backend → Render
-
-Build command: `pip install -r requirements.txt`
-Start command: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
+Access at: `http://YOUR_GCP_IP`
 
 ---
 
