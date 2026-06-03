@@ -95,6 +95,10 @@ export async function POST(req: NextRequest) {
             env: "LOCAL",
             model: { modelName: "openai/gpt-4o-mini", apiKey: openaiKey },
             verbose: 0,
+            localBrowserLaunchOptions: {
+              executablePath: process.env.CHROME_PATH || undefined,
+              args: ["--no-sandbox", "--disable-dev-shm-usage"],
+            },
           }
     );
 

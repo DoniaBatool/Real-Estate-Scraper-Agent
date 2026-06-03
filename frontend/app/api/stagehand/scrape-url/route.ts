@@ -304,8 +304,10 @@ export async function POST(req: NextRequest) {
             verbose: 0,
             selfHeal: true,
             localBrowserLaunchOptions: {
+              executablePath: process.env.CHROME_PATH || undefined,
               args: [
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1366,768",
