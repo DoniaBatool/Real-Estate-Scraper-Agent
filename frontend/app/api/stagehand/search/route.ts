@@ -115,7 +115,7 @@ async function createStagehand() {
           verbose: 0,
           localBrowserLaunchOptions: {
             executablePath: process.env.CHROME_PATH || undefined,
-            args: ["--no-sandbox", "--disable-dev-shm-usage"],
+            args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--disable-setuid-sandbox"],
           },
         }
   );

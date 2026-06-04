@@ -308,6 +308,9 @@ export async function POST(req: NextRequest) {
               args: [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1366,768",
