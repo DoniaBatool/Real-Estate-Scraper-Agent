@@ -432,6 +432,92 @@ Set `CHROME_PATH` via PM2. Error port changed (new error, not cached). Still ECO
 
 ---
 
+## Zod Schema Gotchas with Stagehand/LLM Extraction
+
+These bugs cause silent failures where valid data is extracted but the schema rejects it.
+
+### Bug 1: Field named `properties` causes nested object instead of array
+
+**Symptom:**
+```json
+{"properties": {"properties": [], "agency_name": "..."}}
+```
+The LLM returns an object instead of an array for the `properties` field.
+
+**Root cause:** `properties` is a reserved keyword in JSON Schema. When the Zod schema field is also named `properties`, the LLM gets confused and nests the entire schema under that key.
+
+**Fix:** Rename the field from `properties` to `listings` or `property_list`:
+```typescript
+// ❌ WRONG - clashes with JSON Schema keyword
+const PropertySchema = z.object({
+  properties: z.array(PropertyItem).default([])
+    .describe("ALL property listings..."),
+});
+
+// ✅ CORRECT
+const PropertySchema = z.object({
+  listings: z.array(PropertyItem).default([])
+    .describe("ALL property listing cards. Return as a flat array."),
+});
+```
+
+### Bug 2: `images: [null]` - null inside array fails validation
+
+**Symptom:** `"Invalid input: expected string, received null"` on `images[0]`
+
+**Root cause:** LLM returns `[null]` when no images found. `z.array(z.string())` rejects null items.
+
+**Fix:** Accept nullable items, filter in post-processing:
+```typescript
+// ❌ WRONG
+images: z.array(z.string()).nullable().optional().default([])
+
+// ✅ CORRECT
+images: z.array(z.union([z.string(), z.null()])).nullable().optional().default([])
+
+// Then in post-processing:
+const cleanImages = (p.images || []).filter((u): u is string => 
+  typeof u === "string" && isRealUrl(u)
+);
+```
+
+### Bug 3: `listing_url: "https://"` partial URL passes startsWith check
+
+**Symptom:** Properties with `listing_url: "https://"` show "No link" but don't error.
+
+**Root cause:** `"https://".startsWith("http")` is true, so it passes the old check. `new URL("https://")` throws, but only if the try/catch reaches it.
+
+**Fix:** Add explicit guard before URL parsing:
+```typescript
+const isFakeUrl = (u: string): boolean => {
+  if (!u) return true;
+  if (/^https?:\/\/?$/.test(u.trim())) return true;  // catches "https://" and "http://"
+  try {
+    const parsed = new URL(u);
+    if (!parsed.hostname || !parsed.hostname.includes(".")) return true;
+    // ... rest of checks
+  } catch { return true; }
+};
+```
+
+### Bug 4: Concurrent SQLAlchemy session (memory update)
+
+**Symptom:** `InvalidRequestError: This session is provisioning a new connection; concurrent operations are not permitted`
+
+**Root cause:** `asyncio.ensure_future(update_user_memory(db, ...))` passes the SAME session to a background task while the main request is still using it.
+
+**Fix:** Create a fresh session inside the background task:
+```python
+async def _run_memory_update():
+    _, factory = _get_engine()
+    async with factory() as fresh_db:
+        await update_user_memory(fresh_db, ...)
+
+asyncio.ensure_future(_run_memory_update())
+```
+
+---
+
 ## Summary: What Went Wrong & What Fixed It
 
 1. **Chrome not found** → Set `CHROME_PATH` in `.env.local` AND PM2 env via `--update-env`

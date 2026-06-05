@@ -57,7 +57,7 @@ const PropertyItem = z.object({
     .string().nullable().optional()
     .describe("DIRECT link to the individual property page — must start with https://. Do NOT invent URLs. Leave empty if not found."),
   images: z
-    .array(z.string()).nullable().optional().default([])
+    .array(z.union([z.string(), z.null()])).nullable().optional().default([])
     .describe("Full https:// URLs of property photos. Only real image URLs — no logos."),
   amenities: z
     .array(z.string()).nullable().optional().default([])
@@ -83,9 +83,9 @@ const PropertyItem = z.object({
 });
 
 const PropertySchema = z.object({
-  properties: z
+  listings: z
     .array(PropertyItem).default([])
-    .describe("ALL property listings visible on the page. Do not skip any."),
+    .describe("ALL property listing cards visible on the page. Return as a flat array. Do not skip any."),
   agency_name: z
     .string().nullable().optional().default("")
     .describe("Name of the real estate agency"),
@@ -217,7 +217,7 @@ export async function POST(req: NextRequest) {
           PropertySchema,
           { serverCache: false }
         );
-        extractedProperties = extracted.properties || [];
+        extractedProperties = extracted.listings || [];
         agencyName = extracted.agency_name || "";
         agencyPhone = extracted.agency_phone || "";
         agencyEmail = extracted.agency_email || "";
@@ -231,7 +231,7 @@ export async function POST(req: NextRequest) {
           PropertySchema,
           { serverCache: false }
         );
-        extractedProperties = extracted.properties || [];
+        extractedProperties = extracted.listings || [];
         agencyName = extracted.agency_name || "";
         agencyPhone = extracted.agency_phone || "";
         agencyEmail = extracted.agency_email || "";
@@ -255,10 +255,11 @@ export async function POST(req: NextRequest) {
 
     const isRealUrl = (u: string): boolean => {
       if (!u) return false;
+      if (/^https?:\/\/?$/.test(u.trim())) return false;
       try {
         const parsed = new URL(u);
         if (!["http:", "https:"].includes(parsed.protocol)) return false;
-        if (!parsed.hostname.includes(".")) return false;
+        if (!parsed.hostname || !parsed.hostname.includes(".")) return false;
         if (/image[-_]url[-_]?\d*/i.test(parsed.hostname)) return false;
         if (/placeholder|dummy|lorem|example\.com/i.test(parsed.hostname)) return false;
         return true;

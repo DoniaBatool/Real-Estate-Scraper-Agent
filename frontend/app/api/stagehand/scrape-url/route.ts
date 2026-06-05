@@ -122,7 +122,7 @@ const PropertyItem = z.object({
     ),
 
   images: z
-    .array(z.string())
+    .array(z.union([z.string(), z.null()]))
     .nullable()
     .optional()
     .default([])
@@ -177,10 +177,10 @@ const PropertyItem = z.object({
 });
 
 const PropertySchema = z.object({
-  properties: z
+  listings: z
     .array(PropertyItem)
     .default([])
-    .describe("ALL property listings visible on the page. Do not skip any."),
+    .describe("ALL property listing cards visible on the page. Return as a flat array. Do not skip any."),
 
   agency_name: z
     .string()
@@ -608,7 +608,7 @@ export async function POST(req: NextRequest) {
         serverCache: false,
       });
 
-      extractedProperties = extracted.properties || [];
+      extractedProperties = extracted.listings || [];
       agencyName = extracted.agency_name || "";
       agencyPhone = extracted.agency_phone || "";
       agencyEmail = extracted.agency_email || "";
@@ -629,7 +629,7 @@ export async function POST(req: NextRequest) {
         // Restore page after fallback agent too
         await ensureActivePage();
         const fb = fallbackResult.output as z.infer<typeof PropertySchema> | undefined;
-        extractedProperties = fb?.properties || [];
+        extractedProperties = fb?.listings || [];
         agencyName = fb?.agency_name || agencyName;
         agencyPhone = fb?.agency_phone || agencyPhone;
         agencyEmail = fb?.agency_email || agencyEmail;
@@ -645,7 +645,7 @@ export async function POST(req: NextRequest) {
           PropertySchema,
           { serverCache: false }
         );
-        extractedProperties = extracted.properties || [];
+        extractedProperties = extracted.listings || [];
         agencyName = extracted.agency_name || "";
         agencyPhone = extracted.agency_phone || "";
         agencyEmail = extracted.agency_email || "";
@@ -918,7 +918,7 @@ export async function POST(req: NextRequest) {
         const nextExtracted = await stagehand!.extract(extractInstruction, PropertySchema, {
           serverCache: false,
         });
-        const nextProps = nextExtracted.properties || [];
+        const nextProps = nextExtracted.listings || [];
 
         // Skip this page if it returned no new properties (we may have looped back)
         if (nextProps.length === 0) {
@@ -1046,13 +1046,15 @@ export async function POST(req: NextRequest) {
 
     const isFakeUrl = (u: string): boolean => {
       if (!u) return true;
+      // Catch partial URLs like "https://" or "http://"
+      if (/^https?:\/\/?$/.test(u.trim())) return true;
       try {
         const parsed = new URL(u);
         // Must be http/https
         if (!["http:", "https:"].includes(parsed.protocol)) return true;
         const host = parsed.hostname;
         // Hostname must contain a dot (real domain)
-        if (!host.includes(".")) return true;
+        if (!host || !host.includes(".")) return true;
         // Known fake/placeholder domains
         const fakeDomains = ["example.com", "placeholder.com", "via.placeholder.com",
           "dummyimage.com", "lorempixel.com", "picsum.photos", "placehold.it",
