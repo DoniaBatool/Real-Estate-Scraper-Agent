@@ -39,7 +39,7 @@ const PropertyDetailSchema = z.object({
     .describe("Furnished status: yes, no, or partial"),
   features: z.array(z.string()).nullable().optional().default([])
     .describe("Every key-value feature from Home Details table: e.g. 'Air Conditioning: Yes', 'Lift: Yes', 'Swimming Pool: No', 'Balconies: 1', 'Parking: Yes'"),
-  images: z.array(z.string().url()).nullable().optional().default([])
+  images: z.array(z.string()).nullable().optional().default([])
     .describe("Full https:// URLs of THIS property's photos — large gallery images only. NO logos, icons, thumbnails from other listings, or placeholder images. Only images that show THIS specific property's interior or exterior."),
   // Individual agent (not just agency)
   agent_name: z.string().nullable().optional().default("")
@@ -97,7 +97,7 @@ export async function POST(req: NextRequest) {
             verbose: 0,
             localBrowserLaunchOptions: {
               executablePath: process.env.CHROME_PATH || undefined,
-              args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--disable-setuid-sandbox"],
+              args: ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--single-process", "--disable-setuid-sandbox"],
             },
           }
     );
@@ -195,57 +195,108 @@ export async function POST(req: NextRequest) {
     } catch { /* ignore */ }
 
     // ── Screenshot carousel/gallery images from the property detail page ─────
-    // Strategy: find all large <img> elements in the gallery/carousel area and
-    // screenshot each one's bounding box. This bypasses S3 auth entirely.
+    // Strategy:
+    // 1. Screenshot the first/hero gallery image
+    // 2. Click the carousel "next" arrow up to 9 more times, screenshot each slide
+    // 3. Also scrape img src URLs directly from DOM (for non-screenshot fallback)
     let carouselScreenshots: string[] = [];
     let pageScreenshot = "";
+
+    // Helper: screenshot the largest visible image on screen
+    const screenshotHeroImage = async (): Promise<string> => {
+      try {
+        const box = await page.evaluate(() => {
+          const imgs = Array.from(document.querySelectorAll("img")) as HTMLImageElement[];
+          let best: { x: number; y: number; w: number; h: number } | null = null;
+          let bestArea = 0;
+          for (const img of imgs) {
+            const r = img.getBoundingClientRect();
+            const src = img.src || (img as HTMLImageElement & {dataset: DOMStringMap}).dataset?.src || "";
+            if (r.width < 200 || r.height < 150) continue;
+            if (src.includes("logo") || src.includes("icon") || src.includes("avatar") ||
+                src.includes("flag") || src.includes("placeholder") || src.includes(".svg")) continue;
+            const area = r.width * r.height;
+            if (area > bestArea) {
+              bestArea = area;
+              best = { x: r.left, y: r.top + window.scrollY, w: r.width, h: r.height };
+            }
+          }
+          return best;
+        }) as { x: number; y: number; w: number; h: number } | null;
+
+        if (box && box.w > 0 && box.h > 0) {
+          const buf = await page.screenshot({
+            type: "jpeg", quality: 82,
+            clip: { x: Math.max(0, box.x), y: Math.max(0, box.y), width: box.w, height: box.h },
+          });
+          return `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
+        }
+      } catch { /* ignore */ }
+      return "";
+    };
+
     try {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(1000);
 
-      // Find bounding boxes of large gallery images (not thumbnails, logos, avatars)
-      const imgBoxes = await page.evaluate(() => {
-        const imgs = Array.from(document.querySelectorAll("img")) as HTMLImageElement[];
-        return imgs
-          .map((img) => {
-            const r = img.getBoundingClientRect();
-            const src = img.src || img.dataset?.src || "";
-            return { x: r.left, y: r.top + window.scrollY, w: r.width, h: r.height, src };
-          })
-          .filter((b) =>
-            b.w >= 200 && b.h >= 150 &&   // large enough to be a property photo
-            b.x >= 0 && b.y >= 0 &&
-            !b.src.includes("logo") &&
-            !b.src.includes("icon") &&
-            !b.src.includes("avatar") &&
-            !b.src.includes("flag") &&
-            !b.src.includes("placeholder") &&
-            !b.src.includes(".svg")
-          )
-          // Sort: largest area first (hero/carousel images tend to be biggest)
-          .sort((a, b) => (b.w * b.h) - (a.w * a.h))
-          .slice(0, 8);
-      }) as { x: number; y: number; w: number; h: number; src: string }[];
+      // Screenshot first image
+      const firstShot = await screenshotHeroImage();
+      if (firstShot) carouselScreenshots.push(firstShot);
 
-      if (imgBoxes.length > 0) {
-        const shots = await Promise.all(
-          imgBoxes.map(async (box) => {
-            try {
-              const buf = await page.screenshot({
-                type: "jpeg", quality: 80,
-                clip: { x: Math.max(0, box.x), y: Math.max(0, box.y), width: box.w, height: box.h },
-              });
-              return `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
-            } catch { return ""; }
-          })
-        );
-        carouselScreenshots = shots.filter(Boolean);
-        // First image also serves as the hero page screenshot
-        pageScreenshot = carouselScreenshots[0] || "";
-      } else {
-        // Fallback: full viewport screenshot
+      // Click through carousel — up to 9 more slides
+      const carouselNextSelectors = [
+        'button[aria-label*="next" i]',
+        'button[aria-label*="Next" i]',
+        '[class*="next"] button',
+        '[class*="carousel"] [class*="next"]',
+        '[class*="slider"] [class*="next"]',
+        '[class*="swiper-button-next"]',
+        '.slick-next',
+        '[class*="arrow-right"]',
+        '[class*="arrow_right"]',
+        'button[class*="right"]',
+      ];
+
+      for (let slide = 0; slide < 9; slide++) {
+        let clicked = false;
+
+        // Try DOM-based click first (faster, no LLM)
+        for (const sel of carouselNextSelectors) {
+          try {
+            const found = await page.evaluate((s: string) => {
+              const el = document.querySelector(s) as HTMLElement | null;
+              if (el) { el.click(); return true; }
+              return false;
+            }, sel);
+            if (found) { clicked = true; break; }
+          } catch { /* try next selector */ }
+        }
+
+        // Fallback: stagehand.act() with natural language
+        if (!clicked) {
+          try {
+            await stagehand.act(
+              "click the next arrow or right chevron button in the property photo gallery or image slider"
+            );
+            clicked = true;
+          } catch { break; } // no more arrows → stop
+        }
+
+        if (!clicked) break;
+
+        await page.waitForTimeout(600);
+        const shot = await screenshotHeroImage();
+        if (!shot || shot === carouselScreenshots[carouselScreenshots.length - 1]) break; // duplicate = end
+        carouselScreenshots.push(shot);
+      }
+
+      pageScreenshot = carouselScreenshots[0] || "";
+
+      // Fallback: full viewport if no carousel found
+      if (carouselScreenshots.length === 0) {
         const buf = await page.screenshot({ type: "jpeg", quality: 75 });
         pageScreenshot = `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
+        carouselScreenshots = [pageScreenshot];
       }
     } catch { /* ignore */ }
 
