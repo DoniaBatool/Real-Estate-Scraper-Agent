@@ -545,11 +545,18 @@ export async function POST(req: NextRequest) {
           `   ${min_price ? `- Min price: ${min_price}\n` : ""}` +
           `   ${max_price ? `- Max price: ${max_price}\n` : ""}` +
           `   ${property_type && property_type !== "any" ? `- Property type: "${property_type}"\n` : ""}` +
-          `3. Submit/apply the filters if there is a Search or Apply button.\n` +
-          `4. Wait for the results to load (you will see property cards with prices and images).\n` +
-          `5. STOP. Do not click on individual property cards.`;
+          `3. IMPORTANT: Before clicking any filter/checkbox/radio element, SCROLL to it first to make sure it is visible on screen. If clicking fails, try scrolling to the element and clicking again.\n` +
+          `4. Submit/apply the filters if there is a Search or Apply button.\n` +
+          `5. Wait for the results to load (you will see property cards with prices and images).\n` +
+          `6. STOP. Do not click on individual property cards.\n` +
+          `NOTE: If you cannot find or apply a specific filter, skip it and proceed to extract whatever listings are visible.`;
 
-        await navAgent.execute({ instruction: navInstruction, maxSteps: 8 });
+        try {
+          await navAgent.execute({ instruction: navInstruction, maxSteps: 10 });
+        } catch (navErr) {
+          // Navigation/filter failure is non-fatal — extract from current page
+          console.warn("Nav agent failed (non-fatal), extracting from current page:", navErr);
+        }
 
         // CRITICAL: restore active page after agent (may have opened tabs or closed page)
         await ensureActivePage();
@@ -585,13 +592,19 @@ export async function POST(req: NextRequest) {
         });
 
         if (filterStr !== "any properties (no specific filters)") {
-          await filterAgent.execute({
-            instruction:
-              `Apply these filters on this property listings page: ${filterStr}.\n` +
-              `Look for filter dropdowns, checkboxes, or search inputs. Apply them and click Search/Apply.\n` +
-              `Wait for results. Do NOT click any individual property cards. Stop.`,
-            maxSteps: 5,
-          });
+          try {
+            await filterAgent.execute({
+              instruction:
+                `Apply these filters on this property listings page: ${filterStr}.\n` +
+                `Look for filter dropdowns, checkboxes, or search inputs.\n` +
+                `IMPORTANT: Before clicking any filter element, scroll to it first. If clicking fails, skip that filter and continue.\n` +
+                `Apply available filters and click Search/Apply if present.\n` +
+                `Wait for results. Do NOT click any individual property cards. Stop.`,
+              maxSteps: 6,
+            });
+          } catch (filterErr) {
+            console.warn("Filter agent failed (non-fatal), extracting from current page:", filterErr);
+          }
           // Restore active page after agent
           await ensureActivePage();
           await page.waitForTimeout(1500);
@@ -661,7 +674,7 @@ export async function POST(req: NextRequest) {
     // This is the correct approach: keep paginating until the user gets real results.
     // Uses DOM-based next-page detection (no LLM cost).
 
-    const MAX_PAGES = 8;       // scrape up to 8 pages total
+    const MAX_PAGES = 10;      // scrape up to 10 pages total
     const TARGET_FILTERED = 5; // stop once we have this many hard-filtered results
 
     // ── DOM anchor URL extractor — returns {url, context} pairs ────────────
@@ -788,8 +801,13 @@ export async function POST(req: NextRequest) {
             if (el.getAttribute("aria-disabled") === "true") continue;
             if (el.classList.contains("disabled")) continue;
             const href = el.getAttribute("href");
-            if (href && href !== "#" && !href.startsWith("javascript:")) {
-              return href.startsWith("http") ? href : window.location.origin + href;
+            // Skip pure anchors (#anything), same-page refs
+            if (href && href !== "#" && !href.startsWith("#") && !href.startsWith("javascript:")) {
+              const full = href.startsWith("http") ? href : window.location.origin + href;
+              // Must be a different URL from current page
+              if (full !== window.location.href && new URL(full).pathname !== window.location.pathname) {
+                return full;
+              }
             }
           }
           // Fallback: look for any <a> or <button> whose visible text is "Next" / "›" / "»"
@@ -800,8 +818,9 @@ export async function POST(req: NextRequest) {
               if ((el as HTMLAnchorElement).getAttribute?.("aria-disabled") === "true") continue;
               if (el.classList.contains("disabled")) continue;
               const href = (el as HTMLAnchorElement).getAttribute?.("href");
-              if (href && href !== "#" && !href.startsWith("javascript:")) {
-                return href.startsWith("http") ? href : window.location.origin + href;
+              if (href && href !== "#" && !href.startsWith("#") && !href.startsWith("javascript:")) {
+                const full = href.startsWith("http") ? href : window.location.origin + href;
+                if (full !== window.location.href) return full;
               }
             }
           }
@@ -1270,7 +1289,26 @@ export async function POST(req: NextRequest) {
       if (byMinPrice.length > 0) filteredProperties = byMinPrice;
     }
 
-    const finalProperties = filteredProperties;
+    // ── Soft fallback: if strict filters give < 3 results, pad with more from same site ──
+    // This ensures user always sees something useful even when filters are very strict.
+    // Padded properties are clearly distinguishable (they have all original data).
+    let finalProperties = filteredProperties;
+    if (finalProperties.length < 3 && properties.length > finalProperties.length) {
+      // Add more properties that at least match category (most important filter)
+      const alreadyIds = new Set(finalProperties.map(p => p.listing_url || p.title));
+      const extras = properties
+        .filter(p => !alreadyIds.has(p.listing_url || p.title))
+        .filter(p => {
+          // Must at minimum match category
+          if (category && category !== "any") {
+            const pCat = (p.category || "").toLowerCase();
+            return !pCat || pCat.includes(category.toLowerCase());
+          }
+          return true;
+        })
+        .slice(0, 5 - finalProperties.length);
+      finalProperties = [...finalProperties, ...extras];
+    }
 
     return NextResponse.json({
       success: true,

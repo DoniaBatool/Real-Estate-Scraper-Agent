@@ -375,7 +375,7 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         data = await _call_stagehand(STAGEHAND_SCRAPE_URL, {
             "url": first_url, "city": city, "country": country,
             "property_type": property_type, "category": category,
-        }, timeout=75.0)
+        }, timeout=130.0)
 
         # Browserbase not configured check
         if "not configured" in str(data.get("error", "")).lower():
@@ -652,7 +652,7 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
             floor_number=int(floor_number_arg) if floor_number_arg is not None else None,
             free_text_prefs=free_text_prefs if free_text_prefs else None,
         )
-        properties = _format_property_list(filtered, limit=5)
+        properties = _format_property_list(filtered, limit=10)
         return json.dumps({
             "status":           "success" if properties else "no_results",
             "url":              url,
