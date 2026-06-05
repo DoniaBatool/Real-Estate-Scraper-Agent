@@ -1083,14 +1083,20 @@ async def run_aria_turn(
                 for m in snippet_msgs
             )
             import asyncio
-            asyncio.ensure_future(
-                update_user_memory(
-                    db,
-                    user_fingerprint=user_fingerprint,
-                    conversation_text=conv_text,
-                    session_id=session_id,
-                )
-            )
+            from backend.database.connection import _get_engine
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            async def _run_memory_update():
+                _, factory = _get_engine()
+                async with factory() as fresh_db:
+                    await update_user_memory(
+                        fresh_db,
+                        user_fingerprint=user_fingerprint,
+                        conversation_text=conv_text,
+                        session_id=session_id,
+                    )
+
+            asyncio.ensure_future(_run_memory_update())
         except Exception as _upd_err:
             logger.warning("Memory update scheduling failed (non-fatal): %s", _upd_err)
 

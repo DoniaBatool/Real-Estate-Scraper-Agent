@@ -54,10 +54,10 @@ const PropertyItem = z.object({
     .string().nullable().optional().default("")
     .describe("Property description or summary text, up to 400 characters"),
   listing_url: z
-    .string().url().nullable().optional()
-    .describe("DIRECT link to the individual property page — must start with https://"),
+    .string().nullable().optional()
+    .describe("DIRECT link to the individual property page — must start with https://. Do NOT invent URLs. Leave empty if not found."),
   images: z
-    .array(z.string().url()).nullable().optional().default([])
+    .array(z.string()).nullable().optional().default([])
     .describe("Full https:// URLs of property photos. Only real image URLs — no logos."),
   amenities: z
     .array(z.string()).nullable().optional().default([])
@@ -115,7 +115,7 @@ async function createStagehand() {
           verbose: 0,
           localBrowserLaunchOptions: {
             executablePath: process.env.CHROME_PATH || undefined,
-            args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--disable-setuid-sandbox"],
+            args: ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--single-process", "--disable-setuid-sandbox"],
           },
         }
   );
@@ -253,10 +253,22 @@ export async function POST(req: NextRequest) {
       }
     })();
 
+    const isRealUrl = (u: string): boolean => {
+      if (!u) return false;
+      try {
+        const parsed = new URL(u);
+        if (!["http:", "https:"].includes(parsed.protocol)) return false;
+        if (!parsed.hostname.includes(".")) return false;
+        if (/image[-_]url[-_]?\d*/i.test(parsed.hostname)) return false;
+        if (/placeholder|dummy|lorem|example\.com/i.test(parsed.hostname)) return false;
+        return true;
+      } catch { return false; }
+    };
+
     const properties = extractedProperties.map((p) => {
       let listingUrl = p.listing_url || "";
       if (listingUrl && listingUrl.startsWith("/")) listingUrl = baseUrl + listingUrl;
-      if (listingUrl && !listingUrl.startsWith("http")) listingUrl = "";
+      if (!isRealUrl(listingUrl)) listingUrl = "";
 
       return {
         title: p.title || "",
@@ -273,7 +285,7 @@ export async function POST(req: NextRequest) {
         full_address: p.full_address || "",
         description: (p.description || "").slice(0, 400),
         listing_url: listingUrl,
-        images: (p.images || []).filter((u): u is string => !!u && u.startsWith("http")).slice(0, 5),
+        images: (p.images || []).filter((u): u is string => isRealUrl(u)).slice(0, 5),
         amenities: (p.amenities || []).slice(0, 15),
         furnished: p.furnished || "",
         floor_number: p.floor_number ?? null,

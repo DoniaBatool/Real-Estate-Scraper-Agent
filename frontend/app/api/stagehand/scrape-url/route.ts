@@ -114,16 +114,15 @@ const PropertyItem = z.object({
 
   listing_url: z
     .string()
-    .url()
     .nullable()
     .optional()
     .describe(
-      "DIRECT link to the individual property page — must be a real URL starting with https://. " +
-        "Do NOT invent URLs. If no direct link is visible, leave empty."
+      "DIRECT link to the individual property page — must start with https://. " +
+        "Do NOT invent URLs. If no direct link is visible, leave this empty or null."
     ),
 
   images: z
-    .array(z.string().url())
+    .array(z.string())
     .nullable()
     .optional()
     .default([])
@@ -306,10 +305,12 @@ export async function POST(req: NextRequest) {
             localBrowserLaunchOptions: {
               executablePath: process.env.CHROME_PATH || undefined,
               args: [
+                "--headless=new",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-zygote",
+                "--single-process",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
@@ -1046,15 +1047,24 @@ export async function POST(req: NextRequest) {
     const isFakeUrl = (u: string): boolean => {
       if (!u) return true;
       try {
-        const host = new URL(u).host;
-        return (
-          host === "example.com" || host === "placeholder.com" ||
-          host === "via.placeholder.com" || host === "dummyimage.com" ||
-          host.includes("lorem") ||
-          u.includes("/link1") || u.includes("/link2") ||
-          u.includes("/image1") || u.includes("/image2")
-        );
-      } catch { return true; }
+        const parsed = new URL(u);
+        // Must be http/https
+        if (!["http:", "https:"].includes(parsed.protocol)) return true;
+        const host = parsed.hostname;
+        // Hostname must contain a dot (real domain)
+        if (!host.includes(".")) return true;
+        // Known fake/placeholder domains
+        const fakeDomains = ["example.com", "placeholder.com", "via.placeholder.com",
+          "dummyimage.com", "lorempixel.com", "picsum.photos", "placehold.it",
+          "placeimg.com", "unsplash.it"];
+        if (fakeDomains.some(d => host === d || host.endsWith("." + d))) return true;
+        // LLM-hallucinated placeholder patterns
+        if (/image[-_]url[-_]?\d*/i.test(host)) return true;
+        if (/placeholder|dummy|lorem|fake[-_]?url/i.test(host)) return true;
+        // Generic path patterns
+        if (/\/(link|image|photo)\d+$/i.test(parsed.pathname)) return true;
+        return false;
+      } catch { return true; }  // new URL() throws on spaces → fake URL
     };
 
     // ── Smart URL resolution ──────────────────────────────────────────────

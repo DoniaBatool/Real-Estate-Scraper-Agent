@@ -864,14 +864,7 @@ function ChatPageContent() {
   const [pageError, setPageError] = useState("");
   const [renameTarget, setRenameTarget] = useState<ChatThread | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [menuMessageId, setMenuMessageId] = useState<string>("");
-
-  // Close message menu on outside click
-  useEffect(() => {
-    const handler = () => setMenuMessageId("");
-    document.addEventListener("click", handler);
-    return () => document.removeEventListener("click", handler);
-  }, []);
+  const [hoveredMessageId, setHoveredMessageId] = useState<string>("");
   const [renameValue, setRenameValue] = useState("");
   const [voiceListening, setVoiceListening] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -996,7 +989,7 @@ function ChatPageContent() {
       await deleteChatMessage(messageId);
       setMessages(prev => prev.filter(m => m.id !== messageId));
     } catch { setPageError("Message delete failed."); }
-    setMenuMessageId("");
+    setHoveredMessageId("");
   };
 
   const clearAll = async () => {
@@ -1164,7 +1157,7 @@ function ChatPageContent() {
   const onSubmit = async (e: FormEvent) => { e.preventDefault(); await submitUserMessage(input); };
 
   return (
-    <div style={{ height: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "0.9rem", minHeight: 0, overflow: "hidden" }}>
+    <div style={{ height: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "0.9rem", minHeight: 0 }}>
       <div style={{
         height: "100%",
         display: "grid",
@@ -1357,7 +1350,7 @@ function ChatPageContent() {
         </aside>
 
         {/* ── Chat area ──────────────────────────────────────────────────── */}
-        <div style={{ display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, height: "100%", overflow: "hidden" }}>
+        <div style={{ display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, height: "100%" }}>
 
           {/* Header */}
           <div style={{
@@ -1481,6 +1474,8 @@ function ChatPageContent() {
               return (
                 <div
                   key={m.id}
+                  onMouseEnter={() => setHoveredMessageId(m.id)}
+                  onMouseLeave={() => setHoveredMessageId("")}
                   style={{
                     alignSelf: isUser ? "flex-end" : "flex-start",
                     maxWidth: isUser ? "70%" : "92%",
@@ -1489,8 +1484,8 @@ function ChatPageContent() {
                     gap: 4,
                   }}
                 >
-                  {/* Avatar + bubble + 3-dot row */}
-                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start", position: "relative" }}>
+                  {/* Avatar + bubble row */}
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
                     <div style={{
                       marginTop: 4,
                       width: 24, height: 24, borderRadius: 999, flexShrink: 0,
@@ -1575,60 +1570,31 @@ function ChatPageContent() {
                     </div>
                   )}
 
-                  {/* 3-dot menu — inline, after the bubble */}
-                  <div style={{ position: "relative", display: "flex", alignItems: "flex-start", paddingTop: 4, flexShrink: 0 }}>
+                  {/* Delete button — shows on hover */}
+                  {hoveredMessageId === m.id && (
                     <button
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); setMenuMessageId(menuMessageId === m.id ? "" : m.id); }}
-                      style={{
-                        background: "none",
-                        border: "none",
-                        color: "var(--text-muted)",
-                        cursor: "pointer",
-                        padding: "2px 5px",
-                        borderRadius: 4,
-                        fontSize: 16,
-                        lineHeight: 1,
-                        opacity: 0.6,
-                      }}
+                      onClick={() => removeMessage(m.id)}
                       title="Delete message"
-                    >⋮</button>
-                    {menuMessageId === m.id && (
-                      <div style={{
-                        position: "absolute",
-                        top: 24,
-                        left: 0,
-                        background: "var(--bg-card)",
-                        border: "1px solid var(--border)",
-                        borderRadius: 8,
-                        padding: "4px",
-                        zIndex: 200,
-                        minWidth: 110,
-                        boxShadow: "0 4px 16px rgba(0,0,0,0.5)",
-                      }}>
-                        <button
-                          type="button"
-                          onClick={() => removeMessage(m.id)}
-                          style={{
-                            width: "100%",
-                            background: "none",
-                            border: "none",
-                            color: "#fca5a5",
-                            cursor: "pointer",
-                            padding: "7px 10px",
-                            borderRadius: 6,
-                            fontSize: "0.8rem",
-                            textAlign: "left",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                          }}
-                        >
-                          <Trash2 size={12} /> Delete
-                        </button>
-                      </div>
-                    )}
-                  </div>
+                      style={{
+                        flexShrink: 0,
+                        alignSelf: "flex-start",
+                        marginTop: 6,
+                        background: "rgba(239,68,68,0.12)",
+                        border: "1px solid rgba(239,68,68,0.25)",
+                        borderRadius: 6,
+                        color: "#fca5a5",
+                        cursor: "pointer",
+                        padding: "3px 7px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                        fontSize: "0.72rem",
+                      }}
+                    >
+                      <Trash2 size={11} /> Delete
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -1686,8 +1652,9 @@ function ChatPageContent() {
                 style={{
                   flex: 1, width: "100%",
                   background: "rgba(255,255,255,0.04)",
-                  border: `1px solid ${voiceListening ? "rgba(239,68,68,0.45)" : "var(--border)"}`,
+                  border: `1px solid ${voiceListening ? "rgba(239,68,68,0.45)" : "rgba(255,255,255,0.1)"}`,
                   borderRadius: 10,
+                  outline: "none",
                   color: "var(--text-primary)",
                   padding: voiceListening ? "0.75rem 0.9rem 0.75rem 1.85rem" : "0.75rem 0.9rem",
                   fontSize: "0.88rem",
