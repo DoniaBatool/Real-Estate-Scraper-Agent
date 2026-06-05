@@ -135,7 +135,7 @@ Every 20 turns: scan for recurring issues → auto-patch system prompt
 | **Web Search** | Tavily API (fallback) → DuckDuckGo fallback |
 | **Database** | Supabase Postgres + pgvector (1536-dim embeddings) |
 | **PDF Export** | WeasyPrint + Jinja2 |
-| **Deployment** | Google Cloud Platform — e2-micro VM (forever free) |
+| **Deployment** | Self-hosted (local) · Google Cloud Platform deployment planned |
 
 ---
 
@@ -409,35 +409,29 @@ python -m pytest ../tests/test_aria_agent.py -v
 
 ## 🚢 Deployment
 
-### Google Cloud Platform (Free Forever)
+### Current: Self-Hosted (Local)
 
-Both frontend and backend deploy on a single **GCP e2-micro VM** (1GB RAM, forever free in us-central1).
-
-**Why GCP e2-micro?**
-- ✅ Forever free (not just 12 months)
-- ✅ 1GB RAM — Playwright/Chromium runs comfortably
-- ✅ Persistent server — no cold starts, no timeouts
-- ✅ `STAGEHAND_ENV=LOCAL` — no Browserbase needed
+ARIA currently runs locally. The app is fully functional on any machine with Node.js 20+ and Python 3.11+.
 
 ```bash
-# On the VM after SSH:
-git clone https://github.com/DoniaBatool/Real-Estate-Scraper-Agent.git
-cd Real-Estate-Scraper-Agent
+# Terminal 1 — backend
+cd backend && source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000
 
-# Backend
-cd backend && python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-# Create .env with your keys
-pm2 start "uvicorn main:app --host 0.0.0.0 --port 8000" --name aria-backend
-
-# Frontend
-cd ../frontend && npm install
-npx playwright install chromium --with-deps
-npm run build
-pm2 start "npm run start" --name aria-frontend
+# Terminal 2 — frontend
+cd frontend
+npm run dev       # development
+# OR
+npm run build && npm start   # production
 ```
 
-Access at: `http://YOUR_GCP_IP`
+### Planned: Google Cloud Platform
+
+GCP deployment is planned once a higher-tier VM is provisioned. Stagehand + Playwright require **minimum 4GB RAM** — the free e2-micro (1GB) is not sufficient.
+
+**Recommended VM:** `e2-medium` (2 vCPU, 4GB RAM) or `e2-standard-2` (8GB RAM)
+
+> 📖 See [`skills/gcp-stagehand-deployment/SKILL.md`](skills/gcp-stagehand-deployment/SKILL.md) for the complete GCP deployment guide — including all issues encountered, Chrome flags, PM2 env setup, and edge cases.
 
 ---
 
@@ -470,6 +464,19 @@ aria-real-estate/
 │   └── test_aria_agent.py         # 96 tests
 └── README.md
 ```
+
+---
+
+## 🧩 Skills Used (Claude Cowork)
+
+This project was built using the following Claude Cowork skills as reusable intelligence:
+
+| Skill | Purpose |
+|---|---|
+| **`stagehand-scraping`** | Expert guide for Stagehand v3 + Browserbase patterns, correct API usage, avoiding common v3 mistakes |
+| **`aria-eval-manager`** | Auto-manages the ARIA eval test suite — writes new test cases into `test_aria_eval.py` and runs the full suite after every code change |
+| **`cinematic-ui`** | Production-quality UI guide — GSAP animations, glass morphism, dark themes, scroll effects used in the chat interface |
+| **`gcp-stagehand-deployment`** | *(Created during this project)* Complete guide for deploying Playwright/Stagehand on GCP — RAM requirements, Chrome flags, PM2 env, all issues + fixes |
 
 ---
 
