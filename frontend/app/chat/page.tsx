@@ -1147,7 +1147,7 @@ function ChatPageContent() {
   const onSubmit = async (e: FormEvent) => { e.preventDefault(); await submitUserMessage(input); };
 
   return (
-    <div style={{ height: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "0.9rem", minHeight: 0 }}>
+    <div style={{ height: "calc(100vh - 60px)", background: "var(--bg-base)", padding: "0.9rem", minHeight: 0, overflow: "hidden" }}>
       <div style={{
         height: "100%",
         display: "grid",
