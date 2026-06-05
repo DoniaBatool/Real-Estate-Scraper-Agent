@@ -183,6 +183,13 @@ async def delete_thread(thread_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Thread not found")
 
 
+@router.delete("/messages/{message_id}", status_code=204)
+async def delete_message(message_id: str, db: AsyncSession = Depends(get_db)):
+    deleted = await crud.delete_chat_message(db, message_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+
 @router.delete("/threads", response_model=ClearAllThreadsResponse)
 async def clear_all_threads(db: AsyncSession = Depends(get_db)):
     threads = await crud.list_chat_threads(db, include_archived=True)

@@ -173,6 +173,17 @@ async def delete_chat_thread(db: AsyncSession, thread_id: str) -> bool:
 
 # ── Messages ───────────────────────────────────────────────────────────────
 
+async def delete_chat_message(db: AsyncSession, message_id: str) -> bool:
+    stmt = select(ChatMessage).where(ChatMessage.id == message_id)
+    result = await db.execute(stmt)
+    message = result.scalar_one_or_none()
+    if not message:
+        return False
+    await db.delete(message)
+    await db.commit()
+    return True
+
+
 async def create_chat_message(
     db: AsyncSession,
     thread_id: str,

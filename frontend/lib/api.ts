@@ -53,6 +53,10 @@ export async function listChatMessages(threadId: string): Promise<ChatMessage[]>
   return data;
 }
 
+export async function deleteChatMessage(messageId: string): Promise<void> {
+  await api.delete(`/api/chat/messages/${messageId}`);
+}
+
 export async function sendThreadMessage(
   threadId: string,
   message: string,
