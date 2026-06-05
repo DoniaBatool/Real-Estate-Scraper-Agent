@@ -865,6 +865,13 @@ function ChatPageContent() {
   const [renameTarget, setRenameTarget] = useState<ChatThread | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [menuMessageId, setMenuMessageId] = useState<string>("");
+
+  // Close message menu on outside click
+  useEffect(() => {
+    const handler = () => setMenuMessageId("");
+    document.addEventListener("click", handler);
+    return () => document.removeEventListener("click", handler);
+  }, []);
   const [renameValue, setRenameValue] = useState("");
   const [voiceListening, setVoiceListening] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -1480,12 +1487,10 @@ function ChatPageContent() {
                     display: "flex",
                     flexDirection: "column",
                     gap: 4,
-                    position: "relative",
                   }}
-                  onMouseLeave={() => { if (menuMessageId === m.id) setMenuMessageId(""); }}
                 >
-                  {/* Avatar + bubble row */}
-                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                  {/* Avatar + bubble + 3-dot row */}
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start", position: "relative" }}>
                     <div style={{
                       marginTop: 4,
                       width: 24, height: 24, borderRadius: 999, flexShrink: 0,
@@ -1570,45 +1575,36 @@ function ChatPageContent() {
                     </div>
                   )}
 
-                  {/* 3-dot delete menu */}
-                  <div style={{
-                    position: "absolute",
-                    top: 0,
-                    right: isUser ? "auto" : -28,
-                    left: isUser ? -28 : "auto",
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                  }}>
+                  {/* 3-dot menu — inline, after the bubble */}
+                  <div style={{ position: "relative", display: "flex", alignItems: "flex-start", paddingTop: 4, flexShrink: 0 }}>
                     <button
                       type="button"
-                      onClick={() => setMenuMessageId(menuMessageId === m.id ? "" : m.id)}
+                      onClick={(e) => { e.stopPropagation(); setMenuMessageId(menuMessageId === m.id ? "" : m.id); }}
                       style={{
                         background: "none",
                         border: "none",
                         color: "var(--text-muted)",
                         cursor: "pointer",
-                        padding: "2px 4px",
+                        padding: "2px 5px",
                         borderRadius: 4,
-                        opacity: 0.5,
-                        fontSize: 14,
+                        fontSize: 16,
                         lineHeight: 1,
+                        opacity: 0.6,
                       }}
-                      title="Message options"
+                      title="Delete message"
                     >⋮</button>
                     {menuMessageId === m.id && (
                       <div style={{
                         position: "absolute",
-                        top: 22,
-                        right: isUser ? "auto" : 0,
-                        left: isUser ? 0 : "auto",
+                        top: 24,
+                        left: 0,
                         background: "var(--bg-card)",
                         border: "1px solid var(--border)",
                         borderRadius: 8,
                         padding: "4px",
-                        zIndex: 100,
-                        minWidth: 100,
-                        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+                        zIndex: 200,
+                        minWidth: 110,
+                        boxShadow: "0 4px 16px rgba(0,0,0,0.5)",
                       }}>
                         <button
                           type="button"
@@ -1619,9 +1615,9 @@ function ChatPageContent() {
                             border: "none",
                             color: "#fca5a5",
                             cursor: "pointer",
-                            padding: "6px 10px",
+                            padding: "7px 10px",
                             borderRadius: 6,
-                            fontSize: "0.78rem",
+                            fontSize: "0.8rem",
                             textAlign: "left",
                             display: "flex",
                             alignItems: "center",
