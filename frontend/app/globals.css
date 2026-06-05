@@ -29,6 +29,17 @@
   --purple: #a78bfa;
 }
 
+/* ── Hero text CSS animations (always reliable, no JS dependency) ── */
+@keyframes heroSlideIn {
+  from { opacity: 0; transform: translateX(-30px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes ariaLetterIn {
+  from { opacity: 0; transform: translateY(40px); filter: blur(12px); }
+  to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
+}
+
 * {
   box-sizing: border-box;
   margin: 0;

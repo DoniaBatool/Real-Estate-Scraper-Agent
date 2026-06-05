@@ -862,6 +862,7 @@ function ChatPageContent() {
   const [menuThreadId, setMenuThreadId] = useState<string>("");
   const [pageError, setPageError] = useState("");
   const [renameTarget, setRenameTarget] = useState<ChatThread | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [renameValue, setRenameValue] = useState("");
   const [voiceListening, setVoiceListening] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -1150,20 +1151,24 @@ function ChatPageContent() {
       <div style={{
         height: "100%",
         display: "grid",
-        gridTemplateColumns: "280px 1fr",
-        gap: "0.9rem",
+        gridTemplateColumns: sidebarOpen ? "280px 1fr" : "0px 1fr",
+        gap: sidebarOpen ? "0.9rem" : 0,
         minHeight: 0,
+        transition: "grid-template-columns 0.25s ease",
       }}>
 
         {/* ── Sidebar ──────────────────────────────────────────────────── */}
         <aside className="card" style={{
           borderRadius: 12,
           border: "1px solid var(--border)",
-          padding: "0.75rem",
+          padding: sidebarOpen ? "0.75rem" : 0,
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
           height: "100%",
+          opacity: sidebarOpen ? 1 : 0,
+          transition: "opacity 0.2s ease, padding 0.25s ease",
+          pointerEvents: sidebarOpen ? "auto" : "none",
         }}>
           {/* ARIA badge */}
           <div style={{
@@ -1195,6 +1200,24 @@ function ChatPageContent() {
               boxShadow: "0 0 6px #34d399",
               flexShrink: 0,
             }} />
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              title="Collapse sidebar"
+              style={{
+                marginLeft: 6,
+                background: "none",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: "2px 4px",
+                borderRadius: 4,
+                display: "flex",
+                alignItems: "center",
+                fontSize: 14,
+                lineHeight: 1,
+              }}
+            >‹</button>
           </div>
 
           {/* New chat */}
@@ -1339,7 +1362,27 @@ function ChatPageContent() {
                 Real Estate Agent · Live web browsing
               </div>
             </div>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: "0.7rem", color: "#34d399" }}>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, fontSize: "0.7rem", color: "#34d399" }}>
+              {!sidebarOpen && (
+                <button
+                  type="button"
+                  onClick={() => setSidebarOpen(true)}
+                  title="Open sidebar"
+                  style={{
+                    background: "rgba(255,255,255,0.05)",
+                    border: "1px solid var(--border)",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    padding: "3px 8px",
+                    borderRadius: 6,
+                    fontSize: 13,
+                    lineHeight: 1,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                >‹ Chats</button>
+              )}
               <div style={{ width: 6, height: 6, borderRadius: 999, background: "#34d399", boxShadow: "0 0 6px #34d399" }} />
               Online
             </div>

@@ -110,16 +110,8 @@ export default function HomePage() {
           { y: -30, opacity: 0 },
           { y: 0, opacity: 1, duration: 0.6 }
         );
-        heroTl.fromTo(".hero-meet",
-          { x: -40, opacity: 0 },
-          { x: 0, opacity: 1, duration: 0.5 },
-          "-=0.2"
-        );
-        heroTl.fromTo(".aria-letter",
-          { y: 80, opacity: 0, filter: "blur(24px)", rotateY: 45 },
-          { y: 0, opacity: 1, filter: "blur(0px)", rotateY: 0, duration: 0.7, stagger: 0.08 },
-          "-=0.2"
-        );
+        // hero-meet and aria-letter use CSS keyframes (always reliable)
+
         heroTl.fromTo(".hero-sub-word",
           { y: 20, opacity: 0 },
           { y: 0, opacity: 1, duration: 0.35, stagger: 0.035 },
@@ -265,14 +257,25 @@ export default function HomePage() {
 
           {/* Headline */}
           <h1 className="mb-5 text-5xl font-bold leading-tight tracking-tight md:text-7xl lg:text-8xl">
-            <span className="hero-meet inline-block text-white" style={{ opacity: 0 }}>Meet</span>{" "}
-            <span className="bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 bg-clip-text text-transparent" aria-label="ARIA">
+            <span
+              className="hero-meet inline-block text-white"
+              style={{ animation: "heroSlideIn 0.6s ease forwards", animationDelay: "0.3s", opacity: 0 }}
+            >Meet</span>{" "}
+            <span aria-label="ARIA">
               {"ARIA".split("").map((l, i) => (
-                <span key={i} className="aria-letter inline-block" style={{ opacity: 0 }}>{l}</span>
+                <span
+                  key={i}
+                  className="inline-block bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 bg-clip-text text-transparent"
+                  style={{
+                    animation: "ariaLetterIn 0.5s ease forwards",
+                    animationDelay: `${0.55 + i * 0.08}s`,
+                    opacity: 0,
+                  }}
+                >{l}</span>
               ))}
             </span>
             <br />
-            <span className="text-4xl font-semibold text-white md:text-5xl lg:text-6xl">
+            <span className="text-4xl font-semibold text-white/90 md:text-5xl lg:text-6xl">
               Your AI Real Estate Agent
             </span>
           </h1>
