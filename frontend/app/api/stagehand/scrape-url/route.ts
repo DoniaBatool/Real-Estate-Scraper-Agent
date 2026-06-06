@@ -309,13 +309,13 @@ export async function POST(req: NextRequest) {
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--no-zygote",
-                "--single-process",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1366,768",
                 `--user-agent=${randomUA}`,
+                // --no-zygote and --single-process crash Chrome on Mac — only add on Linux (GCP/Docker)
+                ...(process.env.CHROME_PATH ? ["--no-zygote", "--single-process"] : []),
               ],
               ignoreDefaultArgs: ["--enable-automation"],
             },
@@ -552,7 +552,7 @@ export async function POST(req: NextRequest) {
           `NOTE: If you cannot find or apply a specific filter, skip it and proceed to extract whatever listings are visible.`;
 
         try {
-          await navAgent.execute({ instruction: navInstruction, maxSteps: 10 });
+          await navAgent.execute({ instruction: navInstruction, maxSteps: 12 });
         } catch (navErr) {
           // Navigation/filter failure is non-fatal — extract from current page
           console.warn("Nav agent failed (non-fatal), extracting from current page:", navErr);
@@ -560,7 +560,16 @@ export async function POST(req: NextRequest) {
 
         // CRITICAL: restore active page after agent (may have opened tabs or closed page)
         await ensureActivePage();
-        await page.waitForTimeout(1500);
+        console.log(`[Nav] After nav agent, URL: ${page.url()}`);
+
+        // Wait for property cards to appear in DOM (handles AJAX/JS-rendered listings)
+        try {
+          await page.waitForSelector(
+            '[class*="property"], [class*="listing"], [class*="result"], [class*="card"], article',
+            { timeout: 6000 }
+          );
+        } catch { /* timeout — proceed anyway, content may still be present */ }
+        await page.waitForTimeout(2500);
 
         // Refresh DOM images after navigation
         try {
@@ -607,7 +616,15 @@ export async function POST(req: NextRequest) {
           }
           // Restore active page after agent
           await ensureActivePage();
-          await page.waitForTimeout(1500);
+          console.log(`[Filter] After filter agent, URL: ${page.url()}`);
+          // Wait for results to render
+          try {
+            await page.waitForSelector(
+              '[class*="property"], [class*="listing"], [class*="result"], [class*="card"], article',
+              { timeout: 5000 }
+            );
+          } catch { /* timeout — proceed */ }
+          await page.waitForTimeout(2000);
         }
       }
 
@@ -617,6 +634,15 @@ export async function POST(req: NextRequest) {
       // Always ensure active page before extract — agent may have left stale state
       await ensureActivePage();
 
+      // Scroll down to trigger lazy-loading of property images & cards, then back to top
+      try {
+        await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight * 0.6); });
+        await page.waitForTimeout(800);
+        await page.evaluate(() => { window.scrollTo(0, 0); });
+        await page.waitForTimeout(400);
+      } catch { /* ignore */ }
+
+      console.log(`[Extract] Extracting from: ${page.url()}`);
       const extracted = await stagehand.extract(extractInstruction, PropertySchema, {
         serverCache: false,
       });

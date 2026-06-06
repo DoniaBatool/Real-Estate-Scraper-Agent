@@ -209,8 +209,11 @@ async def scrape_website(
 
     try:
         parsed = json.loads(result)
+        logger.info("[DEBUG scrape_website] status=%s props_in_result=%d",
+                    parsed.get("status"), len(parsed.get("properties") or []))
         if isinstance(parsed.get("properties"), list):
             all_props = parsed["properties"]
+            logger.info("[DEBUG scrape_website] storing %d props in last_properties", len(all_props))
             # Store ALL for frontend cards — frontend may show up to 12
             ctx.context.last_properties = all_props
             # Give LLM only up to 5 (prevent it from seeing 2 and "comparing" them)
@@ -514,6 +517,51 @@ async def get_property_details(
     # APPEND to context (not replace) so compare gets data from both detail calls
     try:
         parsed = json.loads(result)
+
+        # Stagehand failed — try context fallback before returning error
+        if parsed.get("error") == "could_not_fetch_details":
+            ctx_match = next(
+                (p for p in ctx.context.last_properties
+                 if property_title.lower() in (p.get("title") or "").lower()
+                 or (p.get("title") or "").lower() in property_title.lower()),
+                None,
+            )
+            if ctx_match:
+                logger.info("property-details fallback: using context data for '%s'", property_title)
+                return json.dumps({
+                    "status": "success",
+                    "title":         ctx_match.get("title", property_title),
+                    "price":         ctx_match.get("price"),
+                    "currency":      ctx_match.get("currency", "EUR"),
+                    "listing_url":   ctx_match.get("listing_url", agency_website),
+                    "description":   ctx_match.get("description", ""),
+                    "full_address":  ctx_match.get("full_address", ""),
+                    "locality":      ctx_match.get("locality", ""),
+                    "bedrooms":      ctx_match.get("bedrooms"),
+                    "bathrooms":     ctx_match.get("bathrooms"),
+                    "total_sqm":     ctx_match.get("total_sqm"),
+                    "floor_number":  ctx_match.get("floor_number"),
+                    "furnished":     ctx_match.get("furnished", ""),
+                    "features":      ctx_match.get("amenities", []),
+                    "images":        ctx_match.get("images", []),
+                    "carousel_screenshots": ctx_match.get("carousel_screenshots", []),
+                    "page_screenshot":      ctx_match.get("page_screenshot", ""),
+                    "agent": {
+                        "name":      ctx_match.get("agent_name", ""),
+                        "title":     ctx_match.get("agent_title", ""),
+                        "phone":     ctx_match.get("agent_phone", ""),
+                        "whatsapp":  ctx_match.get("agent_whatsapp", ""),
+                        "email":     ctx_match.get("agent_email", ""),
+                    },
+                    "agency": {
+                        "name":    ctx_match.get("agency_name", ""),
+                        "website": agency_website,
+                    },
+                    "note": f"ℹ️ Could not reach the property page directly — showing cached listing data. For full details visit: {agency_website}",
+                })
+            # No context match either — return the structured error as-is
+            return result
+
         if parsed.get("status") == "success":
             agent_info = parsed.get("agent", {})
             agency_info = parsed.get("agency", {})
@@ -532,8 +580,10 @@ async def get_property_details(
                 "description":    parsed.get("description", ""),
                 "listing_url":    parsed.get("listing_url", ""),
                 "images":               (parsed.get("images") or [])[:10],
-                "page_screenshot":      parsed.get("page_screenshot", ""),
-                "carousel_screenshots": (parsed.get("carousel_screenshots") or [])[:8],
+                # Pull base64 screenshots from _raw_ fields (never sent to LLM)
+                "page_screenshot":      parsed.get("_raw_page_screenshot", ""),
+                "carousel_screenshots": (parsed.get("_raw_carousel_screenshots") or [])[:8],
+                "features":       (parsed.get("features") or [])[:20],
                 "amenities":      (parsed.get("features") or [])[:15],
                 "furnished":      parsed.get("furnished", ""),
                 "agency_name":    agency_info.get("name", ""),
@@ -543,9 +593,22 @@ async def get_property_details(
                 "agent_whatsapp": agent_info.get("whatsapp", ""),
                 "agent_email":    agent_info.get("email", ""),
             }
-            # Keep existing properties + add this one (for multi-detail compare flows)
             existing = [p for p in ctx.context.last_properties if p.get("title") != new_prop["title"]]
             ctx.context.last_properties = existing + [new_prop]
+
+            # Return LLM-safe result: strip _raw_ base64 fields so they never go into context
+            clean = {k: v for k, v in parsed.items() if not k.startswith("_raw_")}
+            return json.dumps(clean)
+
+    except Exception:
+        pass
+
+    # Fallback: strip any _raw_ fields before returning to LLM
+    try:
+        parsed2 = json.loads(result)
+        if any(k.startswith("_raw_") for k in parsed2):
+            clean2 = {k: v for k, v in parsed2.items() if not k.startswith("_raw_")}
+            return json.dumps(clean2)
     except Exception:
         pass
 

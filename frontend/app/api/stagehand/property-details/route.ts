@@ -97,7 +97,17 @@ export async function POST(req: NextRequest) {
             verbose: 0,
             localBrowserLaunchOptions: {
               executablePath: process.env.CHROME_PATH || undefined,
-              args: ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote", "--single-process", "--disable-setuid-sandbox"],
+              args: [
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1366,768",
+                // --no-zygote and --single-process crash Chrome on Mac — only add on Linux (GCP/Docker)
+                ...(process.env.CHROME_PATH ? ["--no-zygote", "--single-process"] : []),
+              ],
             },
           }
     );
@@ -157,77 +167,111 @@ export async function POST(req: NextRequest) {
     // Capture the current URL (this is the individual property page URL)
     const currentUrl = page.url();
 
-    // Capture images from DOM — try all lazy-load attributes
+    // Scroll the page so lazy-loaded images initialise before we grab URLs
+    try {
+      await page.evaluate(() => window.scrollTo(0, 400));
+      await page.waitForTimeout(800);
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(400);
+    } catch { /* ignore */ }
+
+    // Capture image URLs from DOM — only large, ACTUALLY LOADED images
+    // naturalWidth > 10 ensures we skip spinners, 1px trackers, and unloaded lazy imgs
     let domImages: string[] = [];
     try {
       domImages = (await page.evaluate(() => {
-        const imgs = Array.from(document.querySelectorAll("img"));
+        const BAD = ["logo", "icon", ".svg", "placeholder", "flag",
+                     "avatar", "spinner", "blank.gif", "pixel",
+                     "map", "street-view", "static-map", "data:image/gif"];
+        const imgs = Array.from(document.querySelectorAll("img")) as (HTMLImageElement & { dataset: DOMStringMap })[];
         return imgs
-          .map((img) => {
-            const el = img as HTMLImageElement & { dataset: DOMStringMap };
-            // Try every common lazy-load src attribute in priority order
-            return (
-              el.dataset?.lazySrc ||
-              el.dataset?.original ||
-              el.dataset?.src ||
-              el.dataset?.fullSrc ||
-              el.getAttribute("data-lazy") ||
-              el.getAttribute("data-image") ||
-              el.src ||
-              ""
-            );
+          .filter((img) => {
+            const r = img.getBoundingClientRect();
+            if (r.width < 200 || r.height < 150) return false;          // too small
+            if (!img.complete || img.naturalWidth < 10) return false;   // not loaded yet
+            const src = img.dataset?.lazySrc || img.dataset?.original ||
+                        img.dataset?.src || img.src || "";
+            if (!src.startsWith("http")) return false;
+            if (BAD.some(kw => src.toLowerCase().includes(kw))) return false;
+            return true;
           })
-          .filter(
-            (src) =>
-              src.startsWith("http") &&
-              !src.includes("logo") &&
-              !src.includes("icon") &&
-              !src.includes(".svg") &&
-              !src.includes("placeholder") &&
-              !src.includes("flag") &&
-              !src.includes("avatar") &&
-              !src.includes("spinner") &&
-              !src.includes("blank.gif") &&
-              !src.includes("pixel")
-          );
+          .map((img) => (
+            img.dataset?.lazySrc ||
+            img.dataset?.original ||
+            img.dataset?.src ||
+            img.dataset?.fullSrc ||
+            img.getAttribute("data-lazy") ||
+            img.getAttribute("data-image") ||
+            img.src ||
+            ""
+          ))
+          .filter(Boolean);
       })) as string[];
       domImages = [...new Set(domImages)].slice(0, 15);
     } catch { /* ignore */ }
 
     // ── Screenshot carousel/gallery images from the property detail page ─────
-    // Strategy:
-    // 1. Screenshot the first/hero gallery image
-    // 2. Click the carousel "next" arrow up to 9 more times, screenshot each slide
-    // 3. Also scrape img src URLs directly from DOM (for non-screenshot fallback)
     let carouselScreenshots: string[] = [];
     let pageScreenshot = "";
 
-    // Helper: screenshot the largest visible image on screen
+    // Wait for the largest image on the page to fully load (naturalWidth > 0)
+    const waitForHeroImageLoad = async (timeoutMs = 6000): Promise<void> => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const loaded = await page.evaluate(() => {
+          const imgs = Array.from(document.querySelectorAll("img")) as HTMLImageElement[];
+          return imgs.some(img => {
+            const r = img.getBoundingClientRect();
+            const src = img.src || "";
+            if (r.width < 200 || r.height < 150) return false;
+            if (!src || src.includes("logo") || src.includes("icon") || src.includes("data:image/gif")) return false;
+            return img.complete && img.naturalWidth > 10; // loaded and not a 1px tracker
+          });
+        });
+        if (loaded) return;
+        await page.waitForTimeout(400);
+      }
+    };
+
+    // Screenshot the largest LOADED image currently visible on screen.
+    // Clips height to the lesser of the rendered height and viewport height
+    // so we never capture white-space below a partially-rendered image.
     const screenshotHeroImage = async (): Promise<string> => {
       try {
         const box = await page.evaluate(() => {
+          const BAD = ["logo", "icon", "avatar", "flag", "placeholder", ".svg", "data:image/gif", "spinner"];
           const imgs = Array.from(document.querySelectorAll("img")) as HTMLImageElement[];
-          let best: { x: number; y: number; w: number; h: number } | null = null;
+          let best: { x: number; y: number; w: number; h: number; nh: number } | null = null;
           let bestArea = 0;
           for (const img of imgs) {
             const r = img.getBoundingClientRect();
-            const src = img.src || (img as HTMLImageElement & {dataset: DOMStringMap}).dataset?.src || "";
+            const src = img.src || "";
             if (r.width < 200 || r.height < 150) continue;
-            if (src.includes("logo") || src.includes("icon") || src.includes("avatar") ||
-                src.includes("flag") || src.includes("placeholder") || src.includes(".svg")) continue;
+            if (BAD.some(kw => src.toLowerCase().includes(kw))) continue;
+            if (!img.complete || img.naturalWidth < 10) continue;
             const area = r.width * r.height;
             if (area > bestArea) {
               bestArea = area;
-              best = { x: r.left, y: r.top + window.scrollY, w: r.width, h: r.height };
+              // naturalHeight lets us calculate true content height ratio
+              const ratio = img.naturalHeight > 0 ? img.naturalWidth / img.naturalHeight : 0;
+              // rendered content height = rendered width / aspect ratio
+              const contentH = ratio > 0 ? Math.round(r.width / ratio) : r.height;
+              best = {
+                x: r.left, y: r.top + window.scrollY,
+                w: r.width,
+                // clip to actual content height — avoids white padding in image container
+                h: Math.min(r.height, contentH, window.innerHeight),
+                nh: img.naturalHeight,
+              };
             }
           }
           return best;
-        }) as { x: number; y: number; w: number; h: number } | null;
+        }) as { x: number; y: number; w: number; h: number; nh: number } | null;
 
         if (box && box.w > 0 && box.h > 0) {
           const buf = await page.screenshot({
-            type: "jpeg", quality: 82,
-            clip: { x: Math.max(0, box.x), y: Math.max(0, box.y), width: box.w, height: box.h },
+            type: "jpeg", quality: 85,
+            clip: { x: Math.max(0, box.x), y: Math.max(0, box.y), width: box.w, height: Math.max(50, box.h) },
           });
           return `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
         }
@@ -236,7 +280,15 @@ export async function POST(req: NextRequest) {
     };
 
     try {
+      // Scroll down a bit to trigger lazy-load, then back to top
+      await page.evaluate(() => window.scrollTo(0, 300));
+      await page.waitForTimeout(800);
       await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(500);
+
+      // Wait until at least one hero image has actually loaded
+      await waitForHeroImageLoad(6000);
+      // Extra render settle time — JPEG progressive rendering needs this
       await page.waitForTimeout(1000);
 
       // Screenshot first image
@@ -260,7 +312,6 @@ export async function POST(req: NextRequest) {
       for (let slide = 0; slide < 9; slide++) {
         let clicked = false;
 
-        // Try DOM-based click first (faster, no LLM)
         for (const sel of carouselNextSelectors) {
           try {
             const found = await page.evaluate((s: string) => {
@@ -272,21 +323,23 @@ export async function POST(req: NextRequest) {
           } catch { /* try next selector */ }
         }
 
-        // Fallback: stagehand.act() with natural language
         if (!clicked) {
           try {
             await stagehand.act(
               "click the next arrow or right chevron button in the property photo gallery or image slider"
             );
             clicked = true;
-          } catch { break; } // no more arrows → stop
+          } catch { break; }
         }
 
         if (!clicked) break;
 
-        await page.waitForTimeout(600);
+        // Wait for new slide image to load before screenshotting
+        await page.waitForTimeout(800);
+        await waitForHeroImageLoad(3000);
+
         const shot = await screenshotHeroImage();
-        if (!shot || shot === carouselScreenshots[carouselScreenshots.length - 1]) break; // duplicate = end
+        if (!shot || shot === carouselScreenshots[carouselScreenshots.length - 1]) break;
         carouselScreenshots.push(shot);
       }
 
@@ -325,9 +378,10 @@ FEATURES (extract ALL features shown in "Home Details" or property specs section
 
 IMAGES (CRITICAL):
 - images: full https:// URLs of THIS property's own photos ONLY.
-  These are the large gallery/slider images on THIS individual property page.
-  DO NOT include: thumbnails from other listings, logos, icons, agent photos, map images, or any image from a different property.
-  Only include images that show THIS specific property's rooms, exterior, or views.
+  These must be REAL URLs visible on this exact page — do NOT invent or guess URLs.
+  DO NOT use example.com, placeholder.com, or any URL you are not certain exists on this page.
+  DO NOT include: thumbnails from other listings, logos, icons, agent photos, map images.
+  If you cannot find real image URLs, return an empty array [].
 
 INDIVIDUAL AGENT CONTACT (the specific consultant/agent listed for this property, NOT just general agency):
 - agent_name (the person's full name, e.g. "Paul Bondin")
@@ -340,7 +394,7 @@ AGENCY:
 - agency_name
 - agency_phone
 - agency_email
-- listing_url (the URL of this specific property page)
+- listing_url (the EXACT URL from your browser address bar for this property page — do NOT invent)
 
 Return everything you can see on this page.`,
       PropertyDetailSchema
@@ -356,25 +410,61 @@ Return everything you can see on this page.`,
       return v.trim();
     };
 
-    // Merge DOM images with AI-extracted images, filter fakes
-    const isFakeImg = (u: string) =>
-      !u || u.includes("example.com") || u.includes("placeholder") || u.includes("logo") || u.includes("icon");
+    // Filter: reject known-fake or non-property image URLs
+    const BAD_IMG_KEYWORDS = [
+      "example.com", "placeholder", "logo", "icon", "avatar", "flag",
+      "spinner", "blank", "pixel", "map", "static-map", "street-view",
+      "agent-photo", "staff", "team", "profile",
+    ];
+    const isValidPropertyImg = (u: string) =>
+      !!u &&
+      u.startsWith("http") &&
+      !BAD_IMG_KEYWORDS.some(kw => u.toLowerCase().includes(kw));
 
-    const allImages = [
-      ...(extracted.images || []),
-      ...domImages,
-    ].filter((src) => src && src.startsWith("http") && !isFakeImg(src));
-    const uniqueImages = [...new Set(allImages)].slice(0, 15);
+    // Cross-domain validation — LLM sometimes hallucinates URLs from training data.
+    // If extracted listing_url is from a different domain than the page we scraped, discard it.
+    const agencyDomain = (() => { try { return new URL(agency_url).hostname.replace(/^www\./, ""); } catch { return ""; } })();
+    const currentDomain = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ""); } catch { return ""; } })();
+
+    const isSameDomain = (u: string) => {
+      try {
+        const host = new URL(u).hostname.replace(/^www\./, "");
+        return host === agencyDomain || host === currentDomain;
+      } catch { return false; }
+    };
+
+    // AI-extracted images: only keep URLs from the actual scraped domain
+    // (prevents hallucinated example.com / other-site images slipping through)
+    const aiImages = (extracted.images || []).filter(u =>
+      isValidPropertyImg(u) && isSameDomain(u)
+    );
+    const domOnly = domImages.filter(u => isValidPropertyImg(u) && !aiImages.includes(u));
+    const uniqueImages = [...aiImages, ...domOnly].slice(0, 15);
+
+    // Use navigation URL as listing_url (most reliable) — only fall back to LLM
+    // extracted URL if it's on the same domain
+    const extractedListingUrl = clean(extracted.listing_url);
+    const safeListingUrl =
+      currentUrl !== agency_url
+        ? currentUrl
+        : (extractedListingUrl && isSameDomain(extractedListingUrl) ? extractedListingUrl : currentUrl);
+
+    // Sanitize text fields — reject if they look hallucinated (contain placeholder domain)
+    const safeText = (v: string | null | undefined) => {
+      const s = clean(v);
+      if (s.includes("example.com") || s.includes("placeholder.com")) return "";
+      return s;
+    };
 
     return NextResponse.json({
       status: "success",
-      listing_url: currentUrl !== agency_url ? currentUrl : clean(extracted.listing_url),
-      title: clean(extracted.title) || property_title,
+      listing_url: safeListingUrl,
+      title: safeText(extracted.title) || property_title,
       price: extracted.price || property_price,
       currency: clean(extracted.currency) || "EUR",
-      description: clean(extracted.description),
-      full_address: clean(extracted.full_address),
-      locality: clean(extracted.locality) || property_city,
+      description: safeText(extracted.description),
+      full_address: safeText(extracted.full_address),
+      locality: safeText(extracted.locality) || property_city,
       bedrooms: extracted.bedrooms,
       bathrooms: extracted.bathrooms,
       total_sqm: extracted.total_sqm,
@@ -401,6 +491,9 @@ Return everything you can see on this page.`,
   } catch (err: unknown) {
     try { if (stagehand) await stagehand.close(); } catch { /**/ }
     const message = err instanceof Error ? err.message : String(err);
+    const stack   = err instanceof Error ? err.stack  : "";
+    console.error("[property-details] FATAL ERROR:", message);
+    console.error("[property-details] STACK:", stack);
     return NextResponse.json({ error: "Property details fetch failed", detail: message }, { status: 500 });
   }
 }

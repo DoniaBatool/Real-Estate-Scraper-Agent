@@ -261,7 +261,13 @@ Do NOT call compare_properties yet — wait for the user to specify.]""")
     # Catches: "find me apartments", "ghar chahiye", "2 bed villa",
     # "I want a villa with garden" — anything that has preferences but NO location.
     # Must run BEFORE _is_pref_reply so property keywords don't trigger scraping.
-    if not _has_location(msg) and not city:
+    #
+    # SKIP this guard if:
+    # - agency_urls exist from history (user shared a URL earlier → they are answering
+    #   ARIA's preference questions about that site — no need to ask for location again)
+    # - OR this looks like a pref reply (buy/rent + property type answers)
+    _is_url_context_pref_reply = bool(agency_urls) and _is_pref_reply(msg)
+    if not _has_location(msg) and not city and not _is_url_context_pref_reply:
         pref_only_sigs = [
             "bedroom", "bathroom", "villa", "apartment", "studio", "penthouse",
             "bungalow", "flat", "house", "furnished", "pool", "garage",
@@ -905,6 +911,11 @@ async def run_aria_turn(
     correction_hint = ""
     reflection_data: dict | None = None
 
+    # aria_ctx MUST be created ONCE before the retry loop.
+    # If created inside the loop, a retry resets last_properties to [] — scraped
+    # properties from the first attempt are lost and meta["properties"] ends up empty.
+    aria_ctx = AriaRunContext(db=db)
+
     for attempt in range(MAX_RETRIES + 1):
         intent_hint = _build_intent_hint(
             latest_user_text,
@@ -916,7 +927,11 @@ async def run_aria_turn(
         )
         system_prompt = AGENT_SYSTEM_PROMPT + memory_context + intent_hint
 
-        aria_ctx = AriaRunContext(db=db)
+        # On retry: preserve last_properties from the first attempt so
+        # property cards are always included in meta even after a correction pass.
+        saved_last_properties = list(aria_ctx.last_properties)
+        saved_last_compare   = list(aria_ctx.last_compare_properties)
+        saved_tool_trace     = list(aria_ctx.tool_trace)
 
         try:
             text = await _run_agent_once(
@@ -928,12 +943,23 @@ async def run_aria_turn(
                 "aria_tool_trace": aria_ctx.tool_trace,
                 "aria_truncated": True,
                 "reflection": None,
+                "properties": aria_ctx.last_properties[:20],
             }
             return (
                 "I reached the maximum search steps for this turn. Please try a more specific request.",
                 meta,
                 "aria_limit",
             )
+
+        # After the retry run, if the agent didn't scrape again, last_properties
+        # will be empty — restore the saved values so cards still show.
+        if not aria_ctx.last_properties and saved_last_properties:
+            aria_ctx.last_properties = saved_last_properties
+        if not aria_ctx.last_compare_properties and saved_last_compare:
+            aria_ctx.last_compare_properties = saved_last_compare
+        # Merge tool traces (don't lose first-attempt trace on retry)
+        if attempt > 0 and saved_tool_trace and not aria_ctx.tool_trace:
+            aria_ctx.tool_trace = saved_tool_trace
 
         tools_called = [t["tool"] for t in aria_ctx.tool_trace]
 
@@ -945,15 +971,14 @@ async def run_aria_turn(
         )
 
         logger.info(
-            "ARIA reflection [attempt %d/%d]: total=%d issues=%s",
+            "ARIA reflection [attempt %d/%d]: total=%d issues=%s last_props=%d",
             attempt + 1, MAX_RETRIES + 1,
             reflection_data["total"],
             reflection_data["issues"],
+            len(aria_ctx.last_properties),
         )
 
         # ── GUARANTEED QUESTIONS INJECTION ────────────────────────────────
-        # If ARIA showed an agency list but forgot the 🌐 website question,
-        # inject it automatically — no LLM retry needed.
         text = _ensure_clarifying_questions(text)
 
         # If good enough OR no correction possible OR last attempt → keep result
@@ -999,13 +1024,15 @@ async def run_aria_turn(
     action_taken = tool_trace[0]["tool"] if tool_trace else "task"
 
     # If compare was called this turn, use the compared properties for cards
-    # and include the structured compare_result for the frontend CompareBlock
     compare_was_called = "compare_properties" in [t["tool"] for t in tool_trace]
     displayed_properties = (
         aria_ctx.last_compare_properties[:4]
         if compare_was_called and aria_ctx.last_compare_properties
         else (aria_ctx.last_properties[:20] if aria_ctx.last_properties else [])
     )
+    logger.info("[DEBUG] last_properties=%d displayed=%d tools=%s",
+                len(aria_ctx.last_properties), len(displayed_properties),
+                [t["tool"] for t in tool_trace])
 
     meta: dict[str, Any] = {
         "aria": True,

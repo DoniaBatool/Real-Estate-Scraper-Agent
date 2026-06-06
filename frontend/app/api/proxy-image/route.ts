@@ -10,27 +10,11 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 
-// Allow-list: only proxy images from known real-estate domains
-const ALLOWED_ORIGINS = [
-  "amazonaws.com",
-  "s3.",
-  "cloudfront.net",
-  "easyrent",
-  "maltapark",
-  "remax",
-  "frank-salt",
-  "dhalia",
-  "cdnimages",
-  "propertycloud",
-  "imgix.net",
-  "cloudinary.com",
-  "res.cloudinary",
-];
-
+// Allow any valid http/https URL — server-side proxy handles CORS/referer issues
 function isAllowed(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return ALLOWED_ORIGINS.some((o) => parsed.hostname.includes(o));
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
   } catch {
     return false;
   }

@@ -12,9 +12,9 @@ export const API_BASE_URL =
   "http://localhost:8000";
 
 const api = axios.create({
-  baseURL: API_BASE_URL,   // Always call backend directly — no Next.js proxy needed
+  baseURL: API_BASE_URL,
   headers: { "Content-Type": "application/json" },
-  timeout: 180_000,        // 3 minutes — Stagehand scraping can take up to 2 min
+  timeout: 360_000,        // 6 minutes — complex multi-page scrapes can take 3-4 min
 });
 
 // ─── Chat Threads ─────────────────────────────────────────────────────────────

@@ -158,6 +158,8 @@ interface LiveProperty {
   images?: string[];
   amenities?: string[];
   furnished?: string;
+  floor_number?: number;
+  features?: string[];      // detail page: "AC: Yes", "Lift: Yes", etc.
   agency_name?: string;
   agency_website?: string;
   agent_name?: string;
@@ -277,14 +279,27 @@ function PropertyCard({ p, onMoreDetails, onToast }: {
   onToast?: (msg: string, type?: ToastType) => void;
 }) {
   const [lightbox, setLightbox] = useState<{ images: string[]; start: number } | null>(null);
+  const [heroIdx, setHeroIdx] = useState(0);
   const agencyWebsite = p.agency_website || "";
-  // Build proxy URLs so S3-protected images load through our server
+
+  // Base64 screenshots — always reliable, no CORS/403 issues
+  const carouselShots = (p.carousel_screenshots || [])
+    .filter(s => s && s.startsWith("data:image/"));
+  const pageShot = (p.page_screenshot || "").startsWith("data:image/") ? p.page_screenshot! : "";
+
+  // URL-based images — proxy through server to bypass CORS/referer restrictions
   const validImages = (p.images || [])
-    .filter(u => u && (u.startsWith("http") || u.startsWith("data:")) && !u.includes("example.com"))
+    .filter(u => u && (u.startsWith("http://") || u.startsWith("https://") || u.startsWith("data:")))
     .map(u => proxyImg(u, agencyWebsite));
-  // Fallback priority: carousel screenshot #0 → page_screenshot → nothing
-  const screenshotSrc = (p.carousel_screenshots && p.carousel_screenshots[0]) || p.page_screenshot || "";
-  const displayImage = validImages[0] || screenshotSrc || "";
+
+  // Gallery: screenshots first (guaranteed), then any data: URL images
+  const allGalleryImages = [
+    ...carouselShots,
+    ...(pageShot && !carouselShots.includes(pageShot) ? [pageShot] : []),
+    ...validImages.filter(u => !carouselShots.includes(u)),
+  ].filter(Boolean);
+
+  const heroImage = allGalleryImages[Math.min(heroIdx, allGalleryImages.length - 1)] || "";
 
   function handleExportPdf() {
     // Pure frontend PDF — opens a styled print page, no backend dependency.
@@ -303,7 +318,7 @@ function PropertyCard({ p, onMoreDetails, onToast }: {
       if (src.startsWith("/")) return `${window.location.origin}${src}`;
       return src;
     };
-    const imgSrcAbs = absoluteImg(displayImage);
+    const imgSrcAbs = absoluteImg(heroImage);
     const imgHtml = imgSrcAbs ? `<img src="${imgSrcAbs}" style="width:100%;max-height:300px;object-fit:cover;border-radius:8px;margin-bottom:20px" crossorigin="anonymous" />` : "";
     const amenitiesHtml = (p.amenities || []).length
       ? `<div class="section"><h2>Amenities</h2><div class="tags">${(p.amenities || []).map(a => `<span class="tag">${a}</span>`).join("")}</div></div>` : "";
@@ -401,39 +416,57 @@ ${isRealUrl(p.listing_url) ? `<div class="section"><h2>Listing</h2><a href="${p.
         />
       )}
 
-      {/* Single property image — click opens lightbox */}
-      <div
-        style={{ height: 140, overflow: "hidden", background: "rgba(15,23,42,0.8)", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", cursor: displayImage ? "pointer" : "default" }}
-        onClick={() => {
-          if (!displayImage) return;
-          // Collect all available images for lightbox
-          const allImgs = [
-            ...(p.carousel_screenshots || []),
-            ...(validImages.length ? validImages : []),
-            ...(screenshotSrc && !validImages.includes(screenshotSrc) ? [screenshotSrc] : []),
-          ].filter(Boolean);
-          const imgs = allImgs.length ? allImgs : [displayImage];
-          setLightbox({ images: imgs, start: 0 });
-        }}
-        title={displayImage ? "Click to view photos" : undefined}
-      >
-        {displayImage ? (
+      {/* Hero image gallery — click opens lightbox, arrows cycle through photos */}
+      <div style={{ height: 170, background: "rgba(15,23,42,0.8)", position: "relative", overflow: "hidden" }}>
+        {heroImage ? (
           <>
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              src={displayImage}
+              key={heroImage}
+              src={heroImage}
               alt={p.title || "property"}
-              style={{ width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }}
+              style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "top", cursor: "pointer" }}
+              onClick={() => setLightbox({ images: allGalleryImages, start: heroIdx })}
               onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
             />
-            {/* "View listing" overlay hint */}
-            <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0)", transition: "background 0.2s" }}
-              onMouseEnter={e => (e.currentTarget.style.background = "rgba(0,0,0,0.18)")}
+            {/* Photo counter badge */}
+            {allGalleryImages.length > 1 && (
+              <div style={{
+                position: "absolute", top: 8, right: 8,
+                background: "rgba(0,0,0,0.6)", color: "#fff",
+                fontSize: "0.62rem", padding: "2px 7px", borderRadius: 10,
+                backdropFilter: "blur(4px)",
+              }}>
+                {heroIdx + 1}/{allGalleryImages.length}
+              </div>
+            )}
+            {/* Prev arrow */}
+            {heroIdx > 0 && (
+              <button onClick={e => { e.stopPropagation(); setHeroIdx(i => i - 1); }} style={{
+                position: "absolute", left: 6, top: "50%", transform: "translateY(-50%)",
+                background: "rgba(0,0,0,0.5)", border: "none", color: "#fff",
+                fontSize: 18, width: 28, height: 28, borderRadius: "50%", cursor: "pointer", lineHeight: 1,
+              }}>‹</button>
+            )}
+            {/* Next arrow */}
+            {heroIdx < allGalleryImages.length - 1 && (
+              <button onClick={e => { e.stopPropagation(); setHeroIdx(i => i + 1); }} style={{
+                position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)",
+                background: "rgba(0,0,0,0.5)", border: "none", color: "#fff",
+                fontSize: 18, width: 28, height: 28, borderRadius: "50%", cursor: "pointer", lineHeight: 1,
+              }}>›</button>
+            )}
+            {/* Expand hint */}
+            <div
+              onClick={() => setLightbox({ images: allGalleryImages, start: heroIdx })}
+              style={{ position: "absolute", inset: 0, cursor: "pointer",
+                background: "rgba(0,0,0,0)", transition: "background 0.2s" }}
+              onMouseEnter={e => (e.currentTarget.style.background = "rgba(0,0,0,0.15)")}
               onMouseLeave={e => (e.currentTarget.style.background = "rgba(0,0,0,0)")}
             />
           </>
         ) : (
-          <div style={{ color: "#475569", fontSize: "2.5rem", textAlign: "center" }}>🏠</div>
+          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "2.5rem" }}>🏠</div>
         )}
       </div>
 
@@ -498,31 +531,94 @@ ${isRealUrl(p.listing_url) ? `<div class="section"><h2>Listing</h2><a href="${p.
           </div>
         )}
 
-        {/* Carousel screenshots gallery — shown only when More Details are fetched */}
-        {p.carousel_screenshots && p.carousel_screenshots.length > 0 && (
-          <div style={{ marginBottom: "0.5rem", borderTop: "1px solid rgba(148,163,184,0.1)", paddingTop: "0.4rem" }}>
-            <div style={{ fontSize: "0.65rem", color: "var(--text-muted)", marginBottom: "0.3rem", fontWeight: 600 }}>
-              📸 Property Photos ({p.carousel_screenshots.length}) — click to enlarge
+        {/* Thumbnail strip — shown only when 2+ photos available, below hero */}
+        {allGalleryImages.length > 1 && (
+          <div style={{ display: "flex", gap: "0.25rem", overflowX: "auto", padding: "0.3rem 0", marginBottom: "0.3rem" }}>
+            {allGalleryImages.map((src, i) => (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                key={i}
+                src={src}
+                alt={`Photo ${i + 1}`}
+                style={{
+                  width: 60, height: 44, objectFit: "cover", borderRadius: 4, flexShrink: 0,
+                  border: i === heroIdx ? "2px solid #f59e0b" : "2px solid rgba(148,163,184,0.2)",
+                  cursor: "pointer", transition: "opacity 0.15s",
+                }}
+                onClick={() => setHeroIdx(i)}
+                onMouseEnter={e => (e.currentTarget.style.opacity = "0.8")}
+                onMouseLeave={e => (e.currentTarget.style.opacity = "1")}
+                onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Full address — shown after More Details */}
+        {p.full_address && (
+          <div style={{ fontSize: "0.68rem", color: "var(--text-muted)", marginBottom: "0.3rem" }}>
+            🗺️ {p.full_address}
+          </div>
+        )}
+
+        {/* Description — shown after More Details */}
+        {p.description && (
+          <div style={{
+            marginBottom: "0.5rem",
+            borderTop: "1px solid rgba(148,163,184,0.1)",
+            paddingTop: "0.4rem",
+          }}>
+            <div style={{ fontSize: "0.63rem", fontWeight: 700, color: "var(--text-muted)", marginBottom: "0.25rem", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              📝 Description
             </div>
-            <div style={{ display: "flex", gap: "0.3rem", overflowX: "auto", paddingBottom: "0.2rem" }}>
-              {p.carousel_screenshots.map((src, i) => (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  key={i}
-                  src={src}
-                  alt={`Photo ${i + 1}`}
-                  style={{
-                    width: 90, height: 64, objectFit: "cover", borderRadius: 5, flexShrink: 0,
-                    border: "1px solid rgba(148,163,184,0.2)", cursor: "pointer",
-                    transition: "opacity 0.15s",
-                  }}
-                  onClick={() => setLightbox({ images: p.carousel_screenshots!, start: i })}
-                  onMouseEnter={e => (e.currentTarget.style.opacity = "0.8")}
-                  onMouseLeave={e => (e.currentTarget.style.opacity = "1")}
-                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                />
+            <div style={{ fontSize: "0.72rem", color: "var(--text-secondary)", lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+              {p.description}
+            </div>
+          </div>
+        )}
+
+        {/* Features / Home Details — shown after More Details */}
+        {p.features && p.features.length > 0 && (
+          <div style={{
+            marginBottom: "0.5rem",
+            borderTop: "1px solid rgba(148,163,184,0.1)",
+            paddingTop: "0.4rem",
+          }}>
+            <div style={{ fontSize: "0.63rem", fontWeight: 700, color: "var(--text-muted)", marginBottom: "0.3rem", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              🏠 Home Details
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.25rem" }}>
+              {p.features.map((f, i) => (
+                <span key={i} style={{
+                  fontSize: "0.65rem",
+                  background: "rgba(255,255,255,0.05)",
+                  border: "1px solid rgba(148,163,184,0.15)",
+                  borderRadius: 4,
+                  padding: "2px 6px",
+                  color: "var(--text-secondary)",
+                }}>
+                  {f}
+                </span>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Amenities — from listing page */}
+        {p.amenities && p.amenities.length > 0 && !p.features?.length && (
+          <div style={{ marginBottom: "0.4rem", display: "flex", flexWrap: "wrap", gap: "0.25rem" }}>
+            {p.amenities.map((a, i) => (
+              <span key={i} style={{
+                fontSize: "0.63rem",
+                background: "rgba(255,255,255,0.04)",
+                border: "1px solid rgba(148,163,184,0.12)",
+                borderRadius: 4,
+                padding: "2px 6px",
+                color: "var(--text-muted)",
+              }}>
+                {a}
+              </span>
+            ))}
           </div>
         )}
 
@@ -1026,6 +1122,31 @@ function ChatPageContent() {
       const meta = res.message_meta && typeof res.message_meta === "object"
         ? res.message_meta as Record<string, unknown> : {};
 
+      // Replace the optimistic user message with real messages from server.
+      // This gives real UUIDs (so delete works) without causing a flash/reset.
+      const threadAtSend = activeThreadId;
+      listChatMessages(threadAtSend)
+        .then(fresh => {
+          // Only update if user hasn't switched to a different thread
+          setMessages(prev => {
+            const currentThreadMsg = prev.find(m => m.thread_id === threadAtSend);
+            if (!currentThreadMsg && prev.length > 0) return prev; // switched thread
+            return fresh;
+          });
+        })
+        .catch(() => {
+          // Reload failed — keep optimistic + add assistant reply
+          setMessages(prev => [...prev, {
+            id: `a-${Date.now()}`,
+            thread_id: threadAtSend,
+            role: "assistant",
+            content: res.reply,
+            created_at: new Date().toISOString(),
+            meta: { action: res.action, ...meta },
+          }]);
+        });
+
+      // Show assistant reply immediately (don't wait for reload)
       setMessages(prev => [...prev, {
         id: `a-${Date.now()}`,
         thread_id: activeThreadId,
@@ -1034,13 +1155,51 @@ function ChatPageContent() {
         created_at: new Date().toISOString(),
         meta: { action: res.action, ...meta },
       }]);
+
+      // If this was a "More Details" call, merge accurate data back into the original card.
+      // Detail-page data is always more accurate than listing-page data (bed/bath/images etc).
+      const detailProps = Array.isArray(meta?.properties) ? meta.properties as LiveProperty[] : [];
+      if (trimmed.startsWith("More details about:") && detailProps.length > 0) {
+        const detailProp = detailProps[0];
+        if (detailProp.listing_url) {
+          setMessages(prev => prev.map(msg => {
+            if (msg.role !== "assistant") return msg;
+            const msgMeta = msg.meta as Record<string, unknown> | undefined;
+            if (!Array.isArray(msgMeta?.properties)) return msg;
+            const props = msgMeta.properties as LiveProperty[];
+            let changed = false;
+            const updatedProps = props.map((p: LiveProperty) => {
+              if (p.listing_url && p.listing_url === detailProp.listing_url) {
+                changed = true;
+                // Merge: detail data wins (accurate), keep original fields as fallback
+                return { ...p, ...detailProp };
+              }
+              return p;
+            });
+            if (!changed) return msg;
+            return { ...msg, meta: { ...msgMeta, properties: updatedProps } };
+          }));
+        }
+      }
+
       await refreshThreads();
-    } catch {
+    } catch (err: unknown) {
+      const isTimeout = err instanceof Error && (
+        err.message.includes("timeout") || err.message.includes("ECONNABORTED")
+      );
+      const isOffline = err instanceof Error && (
+        err.message.includes("Network Error") || err.message.includes("ECONNREFUSED")
+      );
+      const errMsg = isTimeout
+        ? "⏱️ The request timed out — the website being scraped took too long. Try a simpler search or paste a direct listing URL."
+        : isOffline
+        ? "⚠️ Could not reach the backend. Make sure it's running on port 8000."
+        : "⚠️ Something went wrong. Please try again.";
       setMessages(prev => [...prev, {
         id: `e-${Date.now()}`,
         thread_id: activeThreadId,
         role: "assistant",
-        content: "⚠️ Could not reach the backend. Make sure it's running on port 8000.",
+        content: errMsg,
         created_at: new Date().toISOString(),
       }]);
     } finally {
@@ -1469,7 +1628,7 @@ function ChatPageContent() {
               const compareResult = meta?.compare_result as Record<string, unknown> | undefined;
               const isUser = m.role === "user";
               // DEBUG — remove after fixing
-              if (!isUser && meta) console.log("[ARIA meta]", JSON.stringify({ has_compare: !!compareResult, keys: Object.keys(meta), trace: meta.aria_tool_trace }));
+              // debug: if (!isUser && meta) console.log("[ARIA meta]", { props: Array.isArray(meta.properties) ? (meta.properties as unknown[]).length : 0, trace: meta.aria_tool_trace });
 
               return (
                 <div

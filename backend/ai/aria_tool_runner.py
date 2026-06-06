@@ -391,12 +391,10 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
             p["agency_name"]    = p.get("agency_name") or agency_name
             p["agency_website"] = first_url
 
-        # Hard-filter by user preferences
-        filtered_props = _filter_by_prefs(
-            props,
-            category=category,
-            property_type=property_type,
-        )
+        # Soft-filter by user preferences — fall back to raw if filter removes everything
+        filtered_props = _filter_by_prefs(props, category=category, property_type=property_type)
+        if not filtered_props and props:
+            filtered_props = props  # fallback: show all rather than nothing
         properties = _format_property_list(filtered_props, limit=5)
 
         # Site unreachable — tell ARIA, let user decide (don't auto-advance)
@@ -633,7 +631,10 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         agency_info = data.get("agency") or {}
         agency_name = agency_info.get("name") or url.split("/")[2].replace("www.", "")
 
-        # Hard-filter by user preferences before returning
+        # The scrape-url route already applied Stagehand-level filtering.
+        # Apply Python-side prefs filter as a soft secondary pass.
+        # If the filter removes ALL results, fall back to raw props so the user
+        # always sees something — better than a silent empty result after 2+ min scrape.
         raw_props = data.get("properties") or []
         filtered  = _filter_by_prefs(
             raw_props,
@@ -652,7 +653,20 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
             floor_number=int(floor_number_arg) if floor_number_arg is not None else None,
             free_text_prefs=free_text_prefs if free_text_prefs else None,
         )
+
+        logger.info("[DEBUG tool_runner scrape] raw=%d filtered=%d", len(raw_props), len(filtered))
+        # Fallback: if strict filter killed everything, show raw results with a note
+        used_fallback = False
+        if not filtered and raw_props:
+            filtered = raw_props
+            used_fallback = True
+            logger.info("[DEBUG tool_runner scrape] fallback to raw %d props", len(raw_props))
+
         properties = _format_property_list(filtered, limit=10)
+        fallback_note = (
+            " ⚠️ No exact matches for your filters — showing all available listings from this site."
+            if used_fallback else ""
+        )
         return json.dumps({
             "status":           "success" if properties else "no_results",
             "url":              url,
@@ -662,8 +676,8 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
             "agency":           agency_info,
             "data_freshness":   "real-time — just scraped",
             "note": (
-                f"Showing up to 5 results from {agency_name} ({url}). "
-                f"After presenting results, ALWAYS end with this exact message: "
+                f"Showing {len(properties)} result(s) from {agency_name} ({url}).{fallback_note} "
+                f"After presenting results, ALWAYS end with: "
                 f"'📌 These results are from **{agency_name}**. "
                 f"Would you like to: (1) See more from this same site, "
                 f"(2) Move on to the next agency in the list, "
@@ -783,8 +797,29 @@ Properties data: {json.dumps(properties, default=str, ensure_ascii=False)}"""
             "property_city":  property_city,
         }, timeout=150.0)
 
-        if "error" in data:
-            return json.dumps(data)
+        # If Stagehand failed, return a structured error so the caller can decide fallback
+        if "error" in data or data.get("skipped"):
+            logger.warning("property-details failed for '%s' at %s: %s", property_title, agency_url, data.get("error") or data.get("detail"))
+            return json.dumps({
+                "error": "could_not_fetch_details",
+                "title": property_title,
+                "agency_url": agency_url,
+                "detail": data.get("detail") or data.get("error") or "Stagehand returned an error",
+                "note": (
+                    f"⚠️ Could not access the property page for '{property_title}'. "
+                    f"The site may require login, have bot protection, or the listing may have been removed. "
+                    f"You can view it directly at: {agency_url}"
+                ),
+            })
+
+        # NOTE: page_screenshot and carousel_screenshots are base64 JPEGs (100KB-500KB each).
+        # They MUST NOT go into the LLM tool-result — they'd explode the context window.
+        # They are passed in _raw_data so aria_agents_tools.py can store them in
+        # last_properties (frontend display only), then stripped before returning to the LLM.
+        images = (data.get("images") or [])
+        # Only keep data: URIs that are NOT base64 screenshots (i.e. small inline images)
+        # and http:// URLs — never pass raw base64 JPEGs to the LLM.
+        llm_safe_images = [u for u in images if u.startswith("http")][:5]
 
         return json.dumps({
             "status":         "success",
@@ -801,7 +836,11 @@ Properties data: {json.dumps(properties, default=str, ensure_ascii=False)}"""
             "floor_number":   data.get("floor_number"),
             "furnished":      data.get("furnished", ""),
             "features":       data.get("features", []),
-            "images_count":   len(data.get("images") or []),
+            "images":         llm_safe_images,           # http URLs only, no base64
+            "images_count":   len(images),
+            # base64 fields — stored for frontend but stripped from LLM context in aria_agents_tools.py
+            "_raw_page_screenshot":      data.get("page_screenshot", ""),
+            "_raw_carousel_screenshots": (data.get("carousel_screenshots") or [])[:10],
             "agent":          data.get("agent", {}),
             "agency":         data.get("agency", {}),
             "data_freshness": "real-time — just fetched from property page",
