@@ -605,6 +605,129 @@ class TestStateMerge:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestLiveSearchBedroomPassthrough
+# Verifies that _filter_by_prefs correctly handles the bedroom+locality combo
+# that live_search_properties now passes to the route and Python-side filter.
+# Root cause of the "only 1 property" bug: bedrooms/locality were NOT passed
+# to _filter_by_prefs in live_search — so it filtered too loosely AND
+# the route's countFilteredMatches had no bedroom filter → stopped pagination
+# after any 5 raw properties found on page 1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLiveSearchBedroomPassthrough:
+    PROPS = [
+        {"title": "A", "bedrooms": 2, "category": "sale", "locality": "Sliema", "price": 200000},
+        {"title": "B", "bedrooms": 3, "category": "sale", "locality": "Valletta", "price": 300000},
+        {"title": "C", "bedrooms": 2, "category": "sale", "locality": "Sliema", "price": 250000},
+        {"title": "D", "bedrooms": None, "category": "sale", "locality": "Sliema", "price": 220000},
+        {"title": "E", "bedrooms": 4, "category": "rent", "locality": "Sliema", "price": 2000},
+    ]
+
+    def test_bedrooms_and_locality_filter_together(self):
+        """live_search now passes bedrooms+locality — both must be applied."""
+        result = _filter_by_prefs(self.PROPS, bedrooms=2, locality="sliema", category="sale")
+        titles = [p["title"] for p in result]
+        assert "A" in titles  # 2 bed, Sliema, sale ✅
+        assert "C" in titles  # 2 bed, Sliema, sale ✅
+        assert "B" not in titles  # wrong locality
+        assert "E" not in titles  # wrong category (rent)
+
+    def test_null_bedrooms_kept_when_insufficient_matches(self):
+        """Properties with null bedrooms are kept as fallback so user sees something."""
+        result = _filter_by_prefs(self.PROPS, bedrooms=2, locality="sliema", category="sale")
+        titles = [p["title"] for p in result]
+        # D has null bedrooms in Sliema for sale — soft filter keeps it
+        assert "D" in titles
+
+    def test_category_sale_excludes_rent(self):
+        """Category=sale must exclude rent listings even when bedrooms match."""
+        result = _filter_by_prefs(self.PROPS, bedrooms=4, category="sale")
+        titles = [p["title"] for p in result]
+        assert "E" not in titles  # E is rent, excluded
+
+    def test_full_fallback_when_nothing_matches(self):
+        """If strict filter gives 0, fall back to raw list (soft filter rule)."""
+        result = _filter_by_prefs(self.PROPS, bedrooms=99, category="sale")
+        # bedrooms=99 matches nothing, fallback should return all sale props
+        assert len(result) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestDoublePythonFilterBug
+# Regression tests for the "only 1 result" bug caused by Python re-applying
+# bedroom filter on top of the route's already-filtered output.
+#
+# Root cause: Route paginates until 5 bedroom-matching props found. If site only
+# has 1 match, route does soft-padding with up to 4 extras (category-matching).
+# Those extras may have explicit wrong bedrooms (e.g., 3-bed when user wants 2).
+# Python then re-applies bedroom filter → strips padded extras → 1 result shown.
+#
+# Fix: live_search_properties in tool_runner.py no longer re-applies bedroom
+# filter (only locality and category safety checks remain). The route is the
+# authoritative bedroom filter. Additionally, the route's soft-padding now
+# excludes extras with wrong bedroom counts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDoublePythonFilterBug:
+    """
+    Simulates the state Python _filter_by_prefs receives after the route's
+    soft-padding (extras with wrong bedrooms) and verifies the FIXED behavior.
+    """
+
+    # What the route returns after soft-padding: 1 correct + 4 wrong-bedroom extras
+    PADDED_PROPS = [
+        {"title": "Correct", "bedrooms": 2, "category": "sale", "locality": "Sliema"},
+        {"title": "Padded-3bed", "bedrooms": 3, "category": "sale", "locality": "Valletta"},
+        {"title": "Padded-4bed", "bedrooms": 4, "category": "sale", "locality": "Valletta"},
+        {"title": "Padded-5bed", "bedrooms": 5, "category": "sale", "locality": "Gzira"},
+        {"title": "Padded-6bed", "bedrooms": 6, "category": "sale", "locality": "Mosta"},
+    ]
+
+    def test_bedroom_refilter_causes_1_result(self):
+        """
+        Demonstrates the old bug: Python re-applies bedrooms filter.
+        The 4 padded extras (3/4/5/6 bed) are excluded, leaving only 1 result.
+        This is exactly the bug the fix addresses.
+        """
+        result = _filter_by_prefs(self.PADDED_PROPS, bedrooms=2, category="sale")
+        # ONLY "Correct" (2-bed) survives — the 4 padded props are stripped
+        # This is CORRECT behavior for _filter_by_prefs itself, but WRONG
+        # to apply it on top of the route's already-filtered+padded output.
+        assert len(result) == 1
+        assert result[0]["title"] == "Correct"
+
+    def test_category_only_safety_check_keeps_all_same_category(self):
+        """
+        The FIX: Python only applies category/locality safety check (not bedrooms).
+        With category-only filter, all 5 sale props pass → user sees all 5.
+        """
+        result = _filter_by_prefs(self.PADDED_PROPS, category="sale")
+        assert len(result) == 5, (
+            "When Python skips bedroom re-filter (fix), all 5 props should be kept"
+        )
+
+    def test_wrong_category_padded_props_still_removed(self):
+        """Safety check still works: if route somehow adds wrong-category extras, Python catches them."""
+        mixed = [
+            {"title": "Sale", "bedrooms": 2, "category": "sale"},
+            {"title": "Rent", "bedrooms": 2, "category": "rent"},  # wrong category
+        ]
+        result = _filter_by_prefs(mixed, category="sale")
+        assert len(result) == 1
+        assert result[0]["title"] == "Sale"
+
+    def test_locality_safety_check_still_applies(self):
+        """Locality HARD filter still removes props from wrong locality."""
+        mixed = [
+            {"title": "Sliema", "bedrooms": 2, "category": "sale", "locality": "Sliema"},
+            {"title": "Wrong", "bedrooms": 2, "category": "sale", "locality": "Valletta"},
+        ]
+        result = _filter_by_prefs(mixed, category="sale", locality="sliema")
+        assert len(result) == 1
+        assert result[0]["title"] == "Sliema"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -63,6 +63,7 @@ function PhotoLightbox({ images, startIndex, onClose }: {
           src={images[idx]}
           alt={`Photo ${idx + 1}`}
           style={{ maxWidth: "90vw", maxHeight: "80vh", objectFit: "contain", borderRadius: 8, display: "block" }}
+          onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
         />
       </div>
 
@@ -280,26 +281,53 @@ function PropertyCard({ p, onMoreDetails, onToast }: {
 }) {
   const [lightbox, setLightbox] = useState<{ images: string[]; start: number } | null>(null);
   const [heroIdx, setHeroIdx] = useState(0);
+  // Track URL-based images that failed to load — remove them from gallery entirely
+  // so broken/blank images don't inflate the count or show as empty slots.
+  const [failedImgs, setFailedImgs] = useState<Set<string>>(new Set());
   const agencyWebsite = p.agency_website || "";
 
-  // Base64 screenshots — always reliable, no CORS/403 issues
+  // Base64 screenshots — filter out suspiciously small ones (likely blank/loading frames).
+  // A real property photo JPEG (200px+) compresses to at least ~5KB = ~6700 base64 chars.
+  // A blank/white screenshot at the same size compresses to < 3KB = ~4000 chars.
+  const MIN_SCREENSHOT_B64 = 5000;
   const carouselShots = (p.carousel_screenshots || [])
-    .filter(s => s && s.startsWith("data:image/"));
-  const pageShot = (p.page_screenshot || "").startsWith("data:image/") ? p.page_screenshot! : "";
+    .filter(s => s && s.startsWith("data:image/") && s.length > MIN_SCREENSHOT_B64);
+  const pageShot = (p.page_screenshot || "").startsWith("data:image/") &&
+    (p.page_screenshot || "").length > MIN_SCREENSHOT_B64
+    ? p.page_screenshot! : "";
 
-  // URL-based images — proxy through server to bypass CORS/referer restrictions
+  // URL-based images — proxy through server to bypass CORS/referer restrictions.
+  // Exclude data:image/svg (icons/logos) and very short data URIs (blank placeholders).
   const validImages = (p.images || [])
-    .filter(u => u && (u.startsWith("http://") || u.startsWith("https://") || u.startsWith("data:")))
-    .map(u => proxyImg(u, agencyWebsite));
+    .filter(u => {
+      if (!u) return false;
+      if (u.startsWith("data:image/svg")) return false; // SVG = icon/logo, not a photo
+      if (u.startsWith("data:")) {
+        const b64 = u.split(",")[1] || "";
+        return b64.length > 200; // < 200 base64 chars ≈ blank/trivial image
+      }
+      return u.startsWith("http://") || u.startsWith("https://");
+    })
+    .map(u => proxyImg(u, agencyWebsite))
+    .filter(u => !failedImgs.has(u)); // remove any that 404'd or returned blank
 
-  // Gallery: screenshots first (guaranteed), then any data: URL images
+  // Gallery: real property photos (validImages) first, then carousel/page screenshots as supplement.
+  // carouselShots come LAST because the first carousel screenshot is often captured before
+  // the page fully loads → appears white/blank when placed first.
   const allGalleryImages = [
-    ...carouselShots,
-    ...(pageShot && !carouselShots.includes(pageShot) ? [pageShot] : []),
-    ...validImages.filter(u => !carouselShots.includes(u)),
+    ...validImages,
+    ...carouselShots.filter(s => !validImages.includes(s)),
+    ...(pageShot && !validImages.includes(pageShot) && !carouselShots.includes(pageShot) ? [pageShot] : []),
   ].filter(Boolean);
 
   const heroImage = allGalleryImages[Math.min(heroIdx, allGalleryImages.length - 1)] || "";
+
+  // When an image fails to load (404, broken URL), remove it from the gallery permanently.
+  const handleImgError = (src: string) => {
+    setFailedImgs(prev => new Set([...prev, src]));
+    // If the current hero was the failed image, step back to a valid one
+    setHeroIdx(prev => Math.max(0, prev > 0 ? prev - 1 : 0));
+  };
 
   function handleExportPdf() {
     // Pure frontend PDF — opens a styled print page, no backend dependency.
@@ -427,7 +455,7 @@ ${isRealUrl(p.listing_url) ? `<div class="section"><h2>Listing</h2><a href="${p.
               alt={p.title || "property"}
               style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "top", cursor: "pointer" }}
               onClick={() => setLightbox({ images: allGalleryImages, start: heroIdx })}
-              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+              onError={() => handleImgError(heroImage)}
             />
             {/* Photo counter badge */}
             {allGalleryImages.length > 1 && (
@@ -548,7 +576,7 @@ ${isRealUrl(p.listing_url) ? `<div class="section"><h2>Listing</h2><a href="${p.
                 onClick={() => setHeroIdx(i)}
                 onMouseEnter={e => (e.currentTarget.style.opacity = "0.8")}
                 onMouseLeave={e => (e.currentTarget.style.opacity = "1")}
-                onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                onError={() => handleImgError(src)}
               />
             ))}
           </div>

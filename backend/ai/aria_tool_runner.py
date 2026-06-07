@@ -298,6 +298,11 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         category      = str(args.get("category") or "any").strip()
         max_agencies  = int(args.get("max_agencies") or 4)
         max_agencies  = max(1, min(max_agencies, 6))
+        # Pref filters — passed to route so nav agent applies them in UI and
+        # countFilteredMatches uses them to paginate until 5 MATCHING props found
+        bedrooms_arg  = args.get("bedrooms")     # int | None
+        bathrooms_arg = args.get("bathrooms")    # int | None
+        locality_arg  = str(args.get("locality") or "").strip() or None
 
         if not city and not country:
             return json.dumps({"error": "Please provide at least city or country."})
@@ -357,10 +362,17 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         # NOTE: Pre-flight check removed — HEAD requests blocked by many sites.
         # Stagehand handles unreachable sites internally.
 
-        data = await _call_stagehand(STAGEHAND_SCRAPE_URL, {
+        payload: dict[str, Any] = {
             "url": first_url, "city": city, "country": country,
             "property_type": property_type, "category": category,
-        }, timeout=250.0)
+        }
+        if bedrooms_arg is not None:
+            payload["bedrooms"] = int(bedrooms_arg)
+        if bathrooms_arg is not None:
+            payload["bathrooms"] = int(bathrooms_arg)
+        if locality_arg:
+            payload["locality"] = locality_arg
+        data = await _call_stagehand(STAGEHAND_SCRAPE_URL, payload, timeout=250.0)
 
         # Browserbase not configured check
         if "not configured" in str(data.get("error", "")).lower():
@@ -376,8 +388,19 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
             p["agency_name"]    = p.get("agency_name") or agency_name
             p["agency_website"] = first_url
 
-        # Soft-filter by user preferences — fall back to raw if filter removes everything
-        filtered_props = _filter_by_prefs(props, category=category, property_type=property_type)
+        # The scrape-url route already applied hard+soft filters (locality, category,
+        # bedrooms, bathrooms, property_type) AND padded to at least 3 results.
+        # Re-applying bedrooms/property_type here undoes the route's soft padding:
+        # e.g. route returns [1 correct-bedroom + 4 null-bedroom props]; Python bedroom
+        # filter removes the 4 → only 1 result shown.
+        # FIX: only apply HARD safety checks (locality, category) — skip bedroom re-filter.
+        filtered_props = _filter_by_prefs(
+            props,
+            category=category,
+            locality=locality_arg or "",
+            # bedrooms/bathrooms/property_type intentionally NOT re-applied here —
+            # route already filtered them; re-applying reduces padded results to 1.
+        )
         if not filtered_props and props:
             filtered_props = props  # fallback: show all rather than nothing
         properties = _format_property_list(filtered_props, limit=5)

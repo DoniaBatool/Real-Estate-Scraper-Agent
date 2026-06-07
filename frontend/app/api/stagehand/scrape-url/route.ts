@@ -308,10 +308,11 @@ export async function POST(req: NextRequest) {
                 // Headless mode: off in local dev so you can see the browser live.
                 // Set HEADLESS=true in .env.local to re-enable headless for local testing.
                 ...(process.env.HEADLESS === "true" ? ["--headless=new"] : []),
-                "--no-sandbox",
+                // --no-sandbox is only needed on Linux (Docker/GCP). On macOS it causes a Chrome warning.
+                ...(process.platform === "linux" ? ["--no-sandbox"] : []),
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
+                // --disable-blink-features=AutomationControlled removed: deprecated in newer Chrome, causes warning on macOS
                 "--disable-infobars",
                 "--window-size=1366,768",
                 `--user-agent=${randomUA}`,
@@ -667,11 +668,16 @@ export async function POST(req: NextRequest) {
       // Always ensure active page before extract — agent may have left stale state
       await ensureActivePage();
 
-      // Scroll down to trigger lazy-loading of property images & cards, then back to top
+      // Scroll in sections to trigger lazy-loading of all property cards, then back to top.
+      // Scrolling to 60% is not enough — many sites lazy-load cards progressively.
       try {
-        await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight * 0.6); });
+        await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight * 0.4); });
+        await page.waitForTimeout(600);
+        await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight * 0.7); });
+        await page.waitForTimeout(600);
+        await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); }); // bottom
         await page.waitForTimeout(800);
-        await page.evaluate(() => { window.scrollTo(0, 0); });
+        await page.evaluate(() => { window.scrollTo(0, 0); }); // back to top for clean extraction
         await page.waitForTimeout(400);
       } catch { /* ignore */ }
 
@@ -1258,13 +1264,31 @@ export async function POST(req: NextRequest) {
     const properties = extractedProperties.map((p, idx) => {
       const listingUrl = resolvedUrls[idx] || "";
 
-      const isValidSrc = (src: string) =>
-        src && (src.startsWith("data:image") || (src.startsWith("http") && !isFakeUrl(src)));
+      // Reject blank/trivial images:
+      // - data: URIs must be long enough to contain real pixel data (>= 200 chars after the header)
+      //   e.g. data:image/png;base64,iVBOR... a 1x1 transparent PNG is only ~88 chars → rejected
+      // - http URLs must not look like trackers, logos, or placeholders
+      const isValidSrc = (src: string) => {
+        if (!src) return false;
+        if (src.startsWith("data:image")) {
+          // Filter out SVG (often icons/logos), and any data URI too short to be a real image
+          if (src.startsWith("data:image/svg")) return false;
+          const base64Part = src.split(",")[1] || "";
+          return base64Part.length > 200; // < 200 chars ≈ < 150 bytes ≈ blank/trivial
+        }
+        if (!src.startsWith("http")) return false;
+        if (isFakeUrl(src)) return false;
+        const lower = src.toLowerCase();
+        // Skip known non-photo patterns
+        if (/logo|icon|avatar|spinner|blank|placeholder|pixel|1x1|tracking|\.svg/.test(lower)) return false;
+        return true;
+      };
 
       // Hero image from property's own detail page — guaranteed correct
       const heroShot = listingUrl ? heroImageByUrl.get(listingUrl) || "" : "";
       const realImgs = (p.images || []).filter(isValidSrc);
-      const imgs = heroShot ? [heroShot] : realImgs.slice(0, 1);
+      // Return up to 5 images per property (was slice(0,1) — only 1 image per card)
+      const imgs = heroShot ? [heroShot, ...realImgs.slice(0, 4)] : realImgs.slice(0, 5);
 
       return {
         title: clean(p.title),
@@ -1389,7 +1413,13 @@ export async function POST(req: NextRequest) {
           // Must at minimum match category
           if (category && category !== "any") {
             const pCat = (p.category || "").toLowerCase();
-            return !pCat || pCat.includes(category.toLowerCase());
+            if (pCat && !pCat.includes(category.toLowerCase())) return false;
+          }
+          // Must also match bedrooms (null=unknown=keep, or exact match).
+          // Without this check, Python re-filter strips wrong-bedroom extras → only 1 result.
+          if (bedrooms != null && !isNaN(Number(bedrooms))) {
+            const reqBeds = Number(bedrooms);
+            if (p.bedrooms != null && p.bedrooms !== reqBeds) return false;
           }
           return true;
         })

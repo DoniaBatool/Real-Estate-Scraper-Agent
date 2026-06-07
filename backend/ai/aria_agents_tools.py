@@ -45,6 +45,9 @@ async def live_search_properties(
     property_type: str | None = None,
     category: str | None = None,
     max_agencies: int | None = None,
+    bedrooms: int | None = None,
+    bathrooms: int | None = None,
+    locality: str | None = None,
 ) -> str:
     """
     Browse real estate agency websites LIVE and return current property listings.
@@ -54,6 +57,9 @@ async def live_search_properties(
     (1) More from this site (2) Next agency (3) Give me your own URL.
     If user provides their own URL, use scrape_website instead.
     Returns real-time data scraped directly from agency websites.
+    IMPORTANT: Pass bedrooms/bathrooms/locality when the user specifies them.
+    This ensures pagination runs until 5 MATCHING properties are found (not just any 5).
+    Without these, the scraper stops as soon as 5 random properties are found on page 1.
     """
     _trace(ctx, "live_search_properties")
     args: dict[str, Any] = {"city": city, "country": country}
@@ -63,6 +69,12 @@ async def live_search_properties(
         args["category"] = category
     if max_agencies:
         args["max_agencies"] = max_agencies
+    if bedrooms is not None:
+        args["bedrooms"] = bedrooms
+    if bathrooms is not None:
+        args["bathrooms"] = bathrooms
+    if locality:
+        args["locality"] = locality
 
     result = await execute_aria_tool("live_search_properties", args)
 

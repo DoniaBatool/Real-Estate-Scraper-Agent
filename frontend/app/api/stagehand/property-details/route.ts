@@ -1,5 +1,5 @@
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 200; // screenshots + extraction takes 90-150s — must be > httpx timeout (200s)
 
 /**
  * POST /api/stagehand/property-details
@@ -101,10 +101,11 @@ export async function POST(req: NextRequest) {
                 // Headless: off in local dev so you can see the browser live.
                 // Set HEADLESS=true in .env.local to re-enable.
                 ...(process.env.HEADLESS === "true" ? ["--headless=new"] : []),
-                "--no-sandbox",
+                // --no-sandbox is only needed on Linux (Docker/GCP). On macOS it causes a Chrome warning.
+                ...(process.platform === "linux" ? ["--no-sandbox"] : []),
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
+                // --disable-blink-features=AutomationControlled removed: deprecated in newer Chrome, causes warning on macOS
                 "--window-size=1366,768",
                 // --no-zygote and --single-process crash Chrome on Mac — only add on Linux (GCP/Docker)
                 ...(process.env.CHROME_PATH ? ["--no-zygote", "--single-process"] : []),
@@ -274,6 +275,10 @@ export async function POST(req: NextRequest) {
             type: "jpeg", quality: 85,
             clip: { x: Math.max(0, box.x), y: Math.max(0, box.y), width: box.w, height: Math.max(50, box.h) },
           });
+          // Reject screenshots that are too small to be a real photo.
+          // A solid-color / blank JPEG at this size compresses to < 5KB.
+          // Real property photos are 20KB+ even at small dimensions.
+          if (buf.length < 5000) return "";
           return `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
         }
       } catch { /* ignore */ }
@@ -346,12 +351,10 @@ export async function POST(req: NextRequest) {
 
       pageScreenshot = carouselScreenshots[0] || "";
 
-      // Fallback: full viewport if no carousel found
-      if (carouselScreenshots.length === 0) {
-        const buf = await page.screenshot({ type: "jpeg", quality: 75 });
-        pageScreenshot = `data:image/jpeg;base64,${Buffer.from(buf).toString("base64")}`;
-        carouselScreenshots = [pageScreenshot];
-      }
+      // NOTE: Fallback full-viewport screenshot removed.
+      // It captured the entire page layout (nav bars, text, whitespace) — not a property photo.
+      // When carouselScreenshots is empty, we return no screenshots; the frontend will show
+      // URL-based images from the listing card (validImages) instead.
     } catch { /* ignore */ }
 
     // Extract ALL details from the individual property page
