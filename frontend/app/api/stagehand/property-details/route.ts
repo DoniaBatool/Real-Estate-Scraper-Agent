@@ -98,11 +98,12 @@ export async function POST(req: NextRequest) {
             localBrowserLaunchOptions: {
               executablePath: process.env.CHROME_PATH || undefined,
               args: [
-                "--headless=new",
+                // Headless: off in local dev so you can see the browser live.
+                // Set HEADLESS=true in .env.local to re-enable.
+                ...(process.env.HEADLESS === "true" ? ["--headless=new"] : []),
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--window-size=1366,768",
                 // --no-zygote and --single-process crash Chrome on Mac — only add on Linux (GCP/Docker)

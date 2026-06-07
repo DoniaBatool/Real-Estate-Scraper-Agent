@@ -59,7 +59,7 @@ async def _pre_check_url(target_url: str, timeout: float = 8.0) -> bool:
         return True
 
 
-async def _call_stagehand(url: str, payload: dict, timeout: float = 180.0) -> dict:
+async def _call_stagehand(url: str, payload: dict, timeout: float = 250.0) -> dict:
     """POST to a Stagehand Next.js route and return parsed JSON."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -354,28 +354,13 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         first_url      = agency_urls[0]
         remaining_urls = agency_urls[1:]
 
-        # Pre-flight check before launching Stagehand
-        if not await _pre_check_url(first_url, timeout=8.0):
-            logger.info("Pre-flight: %s unreachable, returning site_unreachable", first_url)
-            next_site = remaining_urls[0] if remaining_urls else None
-            return json.dumps({
-                "status": "site_unreachable",
-                "city": city, "country": country,
-                "skipped_site": first_url,
-                "remaining_agencies": [{"website": u} for u in remaining_urls],
-                "next_site": next_site,
-                "note": (
-                    f"⚠️ {first_url} could not be reached. "
-                    f"Ask the user: shall I try the next site"
-                    + (f" ({next_site})?" if next_site else "?")
-                    + " 😊"
-                ),
-            })
+        # NOTE: Pre-flight check removed — HEAD requests blocked by many sites.
+        # Stagehand handles unreachable sites internally.
 
         data = await _call_stagehand(STAGEHAND_SCRAPE_URL, {
             "url": first_url, "city": city, "country": country,
             "property_type": property_type, "category": category,
-        }, timeout=130.0)
+        }, timeout=250.0)
 
         # Browserbase not configured check
         if "not configured" in str(data.get("error", "")).lower():
@@ -396,6 +381,26 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         if not filtered_props and props:
             filtered_props = props  # fallback: show all rather than nothing
         properties = _format_property_list(filtered_props, limit=5)
+
+        # Bot-protection (Cloudflare etc.) — tell user clearly, offer next site
+        if data.get("bot_blocked") or data.get("reason") == "bot_blocked":
+            next_site = remaining_urls[0] if remaining_urls else None
+            domain = first_url.split("/")[2].replace("www.", "")
+            return json.dumps({
+                "status":            "bot_blocked",
+                "city":              city,
+                "country":           country,
+                "skipped_site":      first_url,
+                "remaining_agencies":[{"website": u} for u in remaining_urls],
+                "next_site":         next_site,
+                "note": (
+                    f"🛡️ {domain} is protected by Cloudflare/bot-detection and blocked automated access. "
+                    f"Tell the user this site cannot be scraped directly. "
+                    f"Ask: shall I try the next site"
+                    + (f" ({next_site})" if next_site else "")
+                    + "? Or would you like to provide a different URL? 😊"
+                ),
+            })
 
         # Site unreachable — tell ARIA, let user decide (don't auto-advance)
         if data.get("skipped") or data.get("reason") == "site_unreachable":
@@ -561,21 +566,10 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         if not url.startswith("http"):
             url = "https://" + url
 
-        # ── Pre-flight reachability check (~8s max) ──────────────────────
-        # Catches dead sites like alliance.mt before Stagehand wastes 35+ seconds
-        reachable = await _pre_check_url(url, timeout=8.0)
-        if not reachable:
-            logger.info("Pre-flight: %s is unreachable, skipping Stagehand", url)
-            return json.dumps({
-                "status": "site_unreachable",
-                "url": url,
-                "properties_found": 0,
-                "properties": [],
-                "note": (
-                    f"⚠️ {url} could not be reached (connection refused or timed out). "
-                    "Tell the user this site is unavailable and ask: shall I try the next agency?"
-                ),
-            })
+        # NOTE: Pre-flight check removed — HEAD requests get blocked by many real estate
+        # sites (bot detection, CloudFlare, referer checks). Stagehand handles unreachable
+        # sites internally and returns an empty result. False negatives here caused ALL
+        # sites to appear unreachable.
 
         payload: dict[str, Any] = {
             "url":           url,
@@ -608,7 +602,21 @@ async def execute_aria_tool(tool_name: str, raw_args: dict[str, Any]) -> str:
         if free_text_prefs:
             payload["free_text_prefs"] = free_text_prefs
 
-        data = await _call_stagehand(STAGEHAND_SCRAPE_URL, payload)
+        data = await _call_stagehand(STAGEHAND_SCRAPE_URL, payload, timeout=250.0)
+
+        # Bot-protection (Cloudflare etc.) — tell ARIA clearly
+        if data.get("bot_blocked") or data.get("reason") == "bot_blocked":
+            domain = url.split("/")[2].replace("www.", "") if "//" in url else url
+            return json.dumps({
+                "status": "bot_blocked",
+                "url": url,
+                "properties_found": 0,
+                "properties": [],
+                "note": (
+                    f"🛡️ {domain} is protected by Cloudflare/bot-detection and blocked automated access. "
+                    "Tell the user this site cannot be scraped directly and suggest they try a different agency URL."
+                ),
+            })
 
         # Site was unreachable (ERR_CONNECTION_TIMED_OUT etc.) — tell ARIA to skip it
         if data.get("skipped") or data.get("reason") == "site_unreachable":
@@ -795,7 +803,7 @@ Properties data: {json.dumps(properties, default=str, ensure_ascii=False)}"""
             "property_title": property_title,
             "property_price": property_price,
             "property_city":  property_city,
-        }, timeout=150.0)
+        }, timeout=200.0)
 
         # If Stagehand failed, return a structured error so the caller can decide fallback
         if "error" in data or data.get("skipped"):

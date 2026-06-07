@@ -1,5 +1,5 @@
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 200; // increased — multi-page scrapes can take 90-150s
 
 /**
  * POST /api/stagehand/scrape-url
@@ -305,11 +305,12 @@ export async function POST(req: NextRequest) {
             localBrowserLaunchOptions: {
               executablePath: process.env.CHROME_PATH || undefined,
               args: [
-                "--headless=new",
+                // Headless mode: off in local dev so you can see the browser live.
+                // Set HEADLESS=true in .env.local to re-enable headless for local testing.
+                ...(process.env.HEADLESS === "true" ? ["--headless=new"] : []),
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1366,768",
@@ -420,6 +421,38 @@ export async function POST(req: NextRequest) {
       }
     }
     if (!navFailed) await page.waitForTimeout(1500);
+
+    // ── Detect bot-protection / Cloudflare challenge ─────────────────────
+    // Cloudflare shows a JS challenge before serving real content.
+    // If we're on a challenge page, extraction will always return 0 —
+    // return early with bot_blocked so ARIA can tell the user clearly.
+    try {
+      const pageTitle = await page.title();
+      const bodyText = await page.evaluate(() =>
+        (document.body?.innerText || "").slice(0, 800)
+      );
+      const isBotBlocked =
+        /verifying you are (a )?human/i.test(bodyText) ||
+        /just a moment/i.test(pageTitle) ||
+        /cf-challenge/i.test(bodyText) ||
+        /enable javascript and cookies/i.test(bodyText) ||
+        /ddos protection/i.test(bodyText) ||
+        /security check/i.test(pageTitle);
+
+      if (isBotBlocked) {
+        console.warn(`[BotBlock] ${url} is showing a bot-protection challenge — returning bot_blocked`);
+        try { await stagehand.close(); } catch { /* ignore */ }
+        return NextResponse.json({
+          success: false,
+          url,
+          bot_blocked: true,
+          reason: "bot_blocked",
+          properties_found: 0,
+          properties: [],
+          agency: { name: "", phone: "", email: "", whatsapp: "", website: url },
+        });
+      }
+    } catch { /* page.title() can fail — proceed anyway */ }
 
     // ── Build filter string ──────────────────────────────────────────────
     const filterStr = buildFilterInstruction({
@@ -566,10 +599,10 @@ export async function POST(req: NextRequest) {
         try {
           await page.waitForSelector(
             '[class*="property"], [class*="listing"], [class*="result"], [class*="card"], article',
-            { timeout: 6000 }
+            { timeout: 4000 }
           );
         } catch { /* timeout — proceed anyway, content may still be present */ }
-        await page.waitForTimeout(2500);
+        await page.waitForTimeout(1500);
 
         // Refresh DOM images after navigation
         try {
@@ -621,10 +654,10 @@ export async function POST(req: NextRequest) {
           try {
             await page.waitForSelector(
               '[class*="property"], [class*="listing"], [class*="result"], [class*="card"], article',
-              { timeout: 5000 }
+              { timeout: 4000 }
             );
           } catch { /* timeout — proceed */ }
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(1200);
         }
       }
 
@@ -653,7 +686,35 @@ export async function POST(req: NextRequest) {
       agencyEmail = extracted.agency_email || "";
       agencyWhatsapp = extracted.agency_whatsapp || "";
 
-      // If extract() returned nothing, try agent() as last resort
+      // If extract() returned nothing, try common listing URL patterns directly
+      if (extractedProperties.length === 0 && isHomepage) {
+        console.warn(`[Fallback] extract() returned 0 — trying direct listing URL patterns`);
+        const listingPaths = [
+          "/properties", "/for-sale", "/buy", "/sale", "/listings",
+          "/search-results", "/properties-for-sale", "/search",
+          "/real-estate", "/apartments", "/residential",
+        ];
+        for (const path of listingPaths) {
+          const tryUrl = baseUrl + path;
+          try {
+            await page.goto(tryUrl, { waitUntil: "domcontentloaded", timeoutMs: 10000 });
+            await page.waitForTimeout(1200);
+            const currentUrl = page.url();
+            // Skip if redirected back to homepage
+            if (new URL(currentUrl).pathname === "/" || currentUrl === url) continue;
+            console.log(`[Fallback] Trying ${tryUrl} → landed on ${currentUrl}`);
+            const tryExtracted = await stagehand.extract(extractInstruction, PropertySchema, { serverCache: false });
+            if ((tryExtracted.listings || []).length > 0) {
+              extractedProperties = tryExtracted.listings || [];
+              agencyName = tryExtracted.agency_name || agencyName;
+              console.log(`[Fallback] Found ${extractedProperties.length} props at ${currentUrl}`);
+              break;
+            }
+          } catch { continue; }
+        }
+      }
+
+      // If still 0, try agent() as last resort
       if (extractedProperties.length === 0) {
         console.warn("extract() returned 0 results, trying agent() fallback");
         const fallbackAgent = stagehand.agent({
@@ -700,7 +761,7 @@ export async function POST(req: NextRequest) {
     // This is the correct approach: keep paginating until the user gets real results.
     // Uses DOM-based next-page detection (no LLM cost).
 
-    const MAX_PAGES = 10;      // scrape up to 10 pages total
+    const MAX_PAGES = 4;       // scrape up to 4 pages total (keeps total scrape time <90s)
     const TARGET_FILTERED = 5; // stop once we have this many hard-filtered results
 
     // ── DOM anchor URL extractor — returns {url, context} pairs ────────────
@@ -893,7 +954,7 @@ export async function POST(req: NextRequest) {
           'or the next page number in a pagination bar. ' +
           'If there is NO such element, or you are already on the last page, do nothing.'
         );
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1200);
         await ensureActivePage();
         const urlAfterAct = page.url();
         if (urlAfterAct !== urlBefore) {
